@@ -289,6 +289,9 @@ class Panel:
             job = e.download
             sc = look.BAD if job.failed else look.FAINT
             paint.draw_text(p, x + tw + 10, y + 6, job.state_text, look.STATE_PX, sc)
+        elif e.item is not None and e.item.busy:
+            # being written by another program (a torrent downloading straight in here)
+            paint.draw_text(p, x + tw + 10, y + 6, "downloading", look.STATE_PX, look.FAINT)
         y += ROW
         # what hovering reveals, grown smoothly into its height
         shown = e.grow.value

@@ -112,9 +112,9 @@ def draw_marker(p: QPainter, cx: float, cy: float, px: float, turn: float, color
     import math
     from PyQt6.QtCore import QLineF
     from PyQt6.QtGui import QPen
-    arm = px * 0.30
+    arm = px * 0.24             # user, 2026-10-22: a little smaller than the type's own "+"
     pen = QPen(color)
-    pen.setWidthF(max(0.8, px / 15))
+    pen.setWidthF(max(0.7, px / 18))
     pen.setCapStyle(Qt.PenCapStyle.FlatCap)
     p.save()
     p.setPen(pen)

@@ -89,6 +89,7 @@ class BrambleWindow(QWidget):
         self.timeline = anim.Timeline(look.CARD_TEXT[1])
         self.panel: Panel | None = None
         self.returning = False                         # closing: the lines wait for the card
+        self.brand_k = anim.Prop(0.0, look.BRAND_MS)  # the name drawing back toward its corner
         self.brand_a = anim.Prop(look.TEXT_SOFT, look.BRAND_MS, look.css_ease)
         self.close_hover = anim.Prop(0.0, look.COLOR_MS, look.css_ease)
         self.hover_key: str | None = None
@@ -166,6 +167,7 @@ class BrambleWindow(QWidget):
                 r.open.set(0.0)
                 r.turn.set(0.0)
         opened = self.open_row is not None
+        self.brand_k.set(1.0 if opened else 0.0)
         self.brand_a.set(look.TEXT_GHOST if opened else look.TEXT_SOFT)
 
     def toggle(self, row: Row) -> None:
@@ -438,7 +440,7 @@ class BrambleWindow(QWidget):
             self.panel = None
             self.shown_row = None
         self.update()
-        busy = (self.timeline.moving or any(r.moving() for r in self.rows) or self.brand_a.moving or self.close_hover.moving or self.returning
+        busy = (self.timeline.moving or any(r.moving() for r in self.rows) or self.brand_a.moving or self.brand_k.moving or self.close_hover.moving or self.returning
                 or (self.panel and self.panel.moving()))
         self.timer.setInterval(16 if busy else 33)
 
@@ -470,9 +472,18 @@ class BrambleWindow(QWidget):
         return x, margin - m.ascent() - b.top()
 
     def _paint_brand(self, p: QPainter) -> None:
+        """At rest where _brand_origin puts it. A category open: the site's
+        translate(-0.5rem, -1rem) scale(0.85) about its top left, at the name's size."""
         x, y = self._brand_origin()
-        paint.draw_text(p, x, y, "bramble", look.BRAND_PX, look.alpha(look.TEXT, self.brand_a.value),
+        k = self.brand_k.value
+        unit = look.BRAND_PX / 5.2
+        p.save()
+        p.translate(x - 0.5 * unit * k, y - 1.0 * unit * k)
+        s = 1 - 0.15 * k
+        p.scale(s, s)
+        paint.draw_text(p, 0, 0, "bramble", look.BRAND_PX, look.alpha(look.TEXT, self.brand_a.value),
                         look.BRAND_WEIGHT, look.BRAND_TRACK)
+        p.restore()
 
     def _paint_rows(self, p: QPainter) -> None:
         f = paint.font(look.MENU_PX, look.MENU_WEIGHT, look.MENU_TRACK)
