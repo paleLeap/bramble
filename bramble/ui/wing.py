@@ -175,7 +175,8 @@ class Wing(QWidget):
         self.choosing = False
         self.paste.hide()
         r = self.chosen
-        self.job = self.main.start_link(link, title=r.title if r else "",
+        site = bool(r and getattr(r, "site", False))
+        self.job = self.main.start_link(link, title=r.title if (r and not site) else "",
                                         source_link=r.link if r else "",
                                         program=self.main.settings["torrent_program"])
 
@@ -296,9 +297,10 @@ class Wing(QWidget):
             col = look.TEXT if chosen else look.mix(look.DIM, look.TEXT, h)
             title = paint.elide(r.title.replace("_", " "), look.LIST_PX, width)
             paint.draw_text(p, x, y + 2, title, look.LIST_PX, col, glow=h)
-            facts = "  ·  ".join(b for b in (r.quality, _size(r.size),
-                                             f"{r.seeders} seeders" if r.seeders >= 0 else "",
-                                             r.source) if b)
+            facts = ("search page" if getattr(r, "site", False) else
+                     "  ·  ".join(b for b in (r.quality, _size(r.size),
+                                              f"{r.seeders} seeders" if r.seeders >= 0 else "",
+                                              r.source) if b))
             paint.draw_text(p, x, y + 20, paint.elide(facts, look.NOTE_PX, width), look.NOTE_PX,
                             look.FAINT)
             row = QRectF(x - 4, y, width + 8, ROW_H - 4)
@@ -347,6 +349,9 @@ class Wing(QWidget):
         if live:
             self.regions.append((cx, "close-download", self.close_download))
         title = kinds._tidy(self.chosen.title)
+        if getattr(self.chosen, "site", False):
+            # what was searched, until the pasted link brings its own name
+            title = self.job.title if self.job is not None else self.query
         paint.draw_text(p, x, y, paint.elide(title, look.LIST_PX, width), look.LIST_PX, look.TEXT)
         y += 22
         if self.pasting:

@@ -28,6 +28,7 @@ class Result:
     quality: str = ""           # 1080p, 2160p ...
     kind_hint: str = ""         # "movie", "episode", "music", "game" if the source says
     page: str = ""              # the result's page on its site, when there is one
+    site: bool = False          # a whole site's search page, opened in the browser
     plugin: object = None       # the plugin that found it (to turn a page into a magnet)
 
 
@@ -84,6 +85,8 @@ def catalog(settings) -> list[tuple[str, str, bool]]:
         except Exception:
             continue
     off = set(settings["sources_off"])
+    for site in settings["sites"]:
+        rows.append(("site:" + site["name"], site["name"], "site:" + site["name"] not in off))
     for path in plugins.found():
         try:
             m = re.search(r"""^\s*name\s*=\s*["']([^"']+)["']""", path.read_text(errors="replace"), re.M)
@@ -91,6 +94,38 @@ def catalog(settings) -> list[tuple[str, str, bool]]:
             m = None
         rows.append((path.stem, m.group(1) if m else path.stem, path.stem not in off))
     return rows
+
+
+MARK = "bramble"
+
+
+def site_from_address(address: str) -> dict:
+    """A site's search page, searched there for the word "bramble", as a site to open.
+    Raises ValueError with a plain reason."""
+    a = address.strip()
+    parts = urllib.parse.urlsplit(a)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise ValueError("That is not a web address.")
+    if MARK not in a.lower():
+        raise ValueError(f'Search that site for the word "{MARK}" first, then paste the address '
+                         "of its results page.")
+    name = parts.netloc.lower().removeprefix("www.")
+    return {"name": name, "url": a}
+
+
+def site_link(site: dict, query: str) -> str:
+    """The site's search page for `query`: its own address with the query where "bramble" was."""
+    url = site["url"]
+    i = url.lower().find(MARK)
+    in_query = "?" in url[:i]
+    q = urllib.parse.quote_plus(query) if in_query else urllib.parse.quote(query)
+    return url[:i] + q + url[i + len(MARK):]
+
+
+def site_results(query: str, sites: list[dict], off: set) -> list[Result]:
+    return [Result(title=s["name"], link=site_link(s, query), source="site", page=site_link(s, query),
+                   site=True)
+            for s in sites if "site:" + s["name"] not in off]
 
 
 def search(query: str, names: list[str], off: set | None = None) -> Outcome:

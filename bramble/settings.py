@@ -32,6 +32,9 @@ DEFAULTS = {
     "sources_off": [],
     # Categories in the order the person made them (folder names, any case).
     "category_order": [],
+    # Sites whose own search page Bramble opens in the browser: [{name, url}], where the
+    # word "bramble" in url stands for what is searched (the person searched it there).
+    "sites": [],
     # The torrent program tried first: "qbittorrent" or "aria2" (the other is the fallback).
     "torrent_program": "qbittorrent",
 }

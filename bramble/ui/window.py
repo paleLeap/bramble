@@ -443,6 +443,10 @@ class BrambleWindow(QWidget):
             self.search.clear()
             self.add_plugin(query)
             return
+        if query.lower().startswith(("http://", "https://")):
+            self.search.clear()
+            self.add_site(query)
+            return
         self.hide_entry()
         if self.panel:
             self.panel.cancel_adding()
@@ -450,17 +454,33 @@ class BrambleWindow(QWidget):
         wing.open_results(query)
         names = list(self.settings["sources"])
         off = set(self.settings["sources_off"])
+        sites = sources.site_results(query, self.settings["sites"], off)
         self.close_leaf()
 
         def done(res, err):
             if wing.query != query:
                 return
             if err or res is None:
-                wing.set_results([], f"The search did not work: {err}")
+                wing.set_results(sites, f"The search did not work: {err}")
                 return
-            note = "" if res.results else ("Nothing found." if not res.errors else " ".join(res.errors))
-            wing.set_results(res.results, note)
+            found = sites + res.results
+            errors = [e for e in res.errors if not (sites and e.startswith("No search sources"))]
+            note = "" if found else ("Nothing found." if not errors else " ".join(errors))
+            if found and errors:
+                note = " ".join(errors)
+            wing.set_results(found, note)
         self.run(lambda: sources.search(query, names, off), done)
+
+    def add_site(self, address: str) -> None:
+        """A site's search page pasted into the search box: open it for every search."""
+        try:
+            site = sources.site_from_address(address)
+        except ValueError as e:
+            self._say(str(e), secs=14)
+            return
+        sites = [s for s in self.settings["sites"] if s["name"] != site["name"]] + [site]
+        self.settings["sites"] = sites
+        self._say(f"added {site['name']} to search", secs=8)
 
     def add_plugin(self, ref: str) -> None:
         """A search plugin's address (or file) given to Bramble: keep it for searching."""
@@ -576,6 +596,13 @@ class BrambleWindow(QWidget):
             return
         page = r.page or (r.link if r.link.startswith(("http://", "https://"))
                           and not r.link.lower().split("?")[0].endswith(".torrent") else "")
+        if r.site:
+            # a site's own results page: open it; the link comes from what the person copies
+            from PyQt6.QtCore import QUrl
+            from PyQt6.QtGui import QDesktopServices
+            QDesktopServices.openUrl(QUrl(r.page))
+            self.wing.open_paste(r, row_y, prefill="")
+            return
         if page:
             from PyQt6.QtCore import QUrl
             from PyQt6.QtGui import QDesktopServices
