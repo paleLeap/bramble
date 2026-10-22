@@ -18,7 +18,7 @@ import shutil
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QPointF, QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QCursor, QPainter, QTransform
+from PyQt6.QtGui import QColor, QPainter
 from PyQt6.QtWidgets import QLineEdit, QWidget
 
 from .. import downloads, fetch, kinds, launcher, library, paths, system, tools
@@ -40,13 +40,15 @@ class Row:
         self.hover = anim.Prop(0.0, look.COLOR_MS, look.css_ease)
         self.mark = anim.Prop(0.0, look.MARK_MS, look.css_ease)
         self.open = anim.Prop(0.0, look.COLOR_MS, look.css_ease)
+        self.turn = anim.Prop(0.0, look.MOVE_MS)              # "+" turning into "\u2212"
 
     @property
     def label(self) -> str:
         return self.cat.label if self.cat else ""
 
     def moving(self) -> bool:
-        return any(p.moving for p in (self.x, self.op, self.scale, self.hover, self.mark, self.open))
+        return any(p.moving for p in (self.x, self.op, self.scale, self.hover, self.mark, self.open,
+                                      self.turn))
 
 
 class CopyJob:
@@ -86,7 +88,8 @@ class BrambleWindow(QWidget):
         self.shown_row: Row | None = None      # the row the card belongs to (kept while closing)
         self.timeline = anim.Timeline(look.CARD_TEXT[1])
         self.panel: Panel | None = None
-        self.brand_k = anim.Prop(0.0, look.BRAND_MS)
+        self.card_h = anim.Prop(0.0, look.MOVE_MS)     # the card follows its contents' height
+        self.returning = False                         # closing: the lines wait for the card
         self.brand_a = anim.Prop(look.TEXT_SOFT, look.BRAND_MS, look.css_ease)
         self.close_hover = anim.Prop(0.0, look.COLOR_MS, look.css_ease)
         self.hover_key: str | None = None
@@ -142,24 +145,28 @@ class BrambleWindow(QWidget):
 
     def _settle(self) -> None:
         """The site's rules: chosen one steps right and grows, the rest slide left and fade."""
+        if self.returning:
+            return                     # nothing moves back until the card has folded away
         for r in self.rows:
             if self.open_row is None:
                 r.x.set(0.0)
                 r.op.set(1.0)
-                r.scale.set(look.HOVER_SCALE if r.hover.target > 0 else 1.0)
+                r.scale.set(look.HOVER_SCALE if (r.hover.target > 0 and r.cat) else 1.0)
                 r.open.set(0.0)
+                r.turn.set(0.0)
             elif r is self.open_row:
                 r.x.set(look.STEP)
                 r.op.set(1.0)
                 r.scale.set(look.OPEN_SCALE)
                 r.open.set(1.0)
+                r.turn.set(1.0)
             else:
                 r.x.set(-look.SLIDE)
                 r.op.set(0.0)
                 r.scale.set(1.0)
                 r.open.set(0.0)
+                r.turn.set(0.0)
         opened = self.open_row is not None
-        self.brand_k.set(1.0 if opened else 0.0)
         self.brand_a.set(look.TEXT_GHOST if opened else look.TEXT_SOFT)
 
     def toggle(self, row: Row) -> None:
@@ -170,9 +177,18 @@ class BrambleWindow(QWidget):
             self.close_category()
             return
         self.hide_entry()
+        if self.returning and row is self.shown_row and self.panel:
+            # clicked again while it was closing: open it back up from where it is
+            self.returning = False
+            self.open_row = row
+            self.timeline.open()
+            self._settle()
+            return
+        self.returning = False
         self.open_row = row
         self.shown_row = row
         self.panel = Panel(self, row.cat)
+        self.card_h.jump(look.ROW * 2 + 2 * look.CARD_PAD)
         self.timeline.open()
         self._settle()
         self.refresh_panel()
@@ -181,9 +197,11 @@ class BrambleWindow(QWidget):
         if self.open_row is None:
             return
         self.hide_entry()
+        if self.panel:
+            self.panel.cancel_adding()
         self.open_row = None
         self.timeline.close()
-        self._settle()
+        self.returning = True          # _tick lets the lines back once the card is gone
 
     def refresh_panel(self) -> None:
         if not self.panel:
@@ -400,30 +418,33 @@ class BrambleWindow(QWidget):
     def _row_y(self, i: int) -> float:
         return look.MENU_TOP + i * look.ROW
 
-    def _card_geometry(self):
+    def _card_geometry(self) -> QRectF | None:
+        """The card: centred across the window, under the chosen line, as tall as what it
+        holds (up to the window's bottom margin)."""
         row = self.shown_row
         if row is None or row not in self.rows:
             return None
         i = self.rows.index(row)
-        y = self._row_y(i)
+        top = self._row_y(i) + look.ROW + 12
         w, h = self.width(), self.height()
-        f = paint.font(look.MENU_PX)
-        title_r = self.x0 + look.STEP + (look.MARKER_W + paint.width(row.label, f)) * look.OPEN_SCALE
-        card = QRectF(self.x0 - 6, y + look.ROW + 12, 0, 0)
-        card.setRight(w - 18)
-        card.setBottom(h - 20)
-        cx = min(card.right() - 12, title_r + 40)
-        return y + look.ROW / 2, title_r + 8, cx, card
+        most = h - top - look.CARD_MARGIN
+        want = self.panel.natural_height() if self.panel else look.ROW * 2
+        self.card_h.set(max(look.ROW * 2 + 2 * look.CARD_PAD, min(most, want)))
+        return QRectF(look.CARD_MARGIN, top, w - 2 * look.CARD_MARGIN, min(most, self.card_h.value))
 
     # --- frame ----------------------------------------------------------------------
     def _tick(self) -> None:
         self.bg.tick()
-        if self.panel and self.timeline.shut and self.open_row is None:
+        if self.returning and self.timeline.position() <= look.CARD_OPEN[0]:
+            self.returning = False     # the card has folded away: now the lines come back
+            self._settle()
+        if self.panel and self.timeline.shut and self.open_row is None and not self.returning:
             self.panel = None
             self.shown_row = None
         self.update()
-        busy = (self.timeline.moving or any(r.moving() for r in self.rows) or self.brand_k.moving
-                or self.brand_a.moving or (self.panel and self.panel.moving()))
+        busy = (self.timeline.moving or any(r.moving() for r in self.rows) or self.card_h.moving
+                or self.brand_a.moving or self.close_hover.moving or self.returning
+                or (self.panel and self.panel.moving()))
         self.timer.setInterval(16 if busy else 33)
 
     def paintEvent(self, _e) -> None:
@@ -438,25 +459,29 @@ class BrambleWindow(QWidget):
         self.regions = []
         self._paint_brand(p)
         self._paint_rows(p)
-        self._paint_lines_and_card(p)
+        self._paint_card(p)
         self._paint_close(p, w)
         p.end()
 
+    def _brand_origin(self) -> tuple[float, float]:
+        """Where "bramble" is drawn so the space above its tall letters equals the space
+        to the left of it. It stays there when a category opens; only its colour fades."""
+        from PyQt6.QtGui import QFontMetricsF
+        f = paint.font(look.BRAND_PX, look.BRAND_WEIGHT, look.BRAND_TRACK)
+        m = QFontMetricsF(f)
+        b = m.tightBoundingRect("b")
+        x = look.BRAND_POS[0]
+        margin = x + b.left()
+        return x, margin - m.ascent() - b.top()
+
     def _paint_brand(self, p: QPainter) -> None:
-        k = self.brand_k.value
-        bx, by = look.BRAND_POS
-        p.save()
-        # the site: translate(-0.5rem, -1rem) scale(0.85) about the top left, at the name's size
-        unit = look.BRAND_PX / 5.2
-        p.translate(bx - 0.5 * unit * k, by - 1.0 * unit * k)
-        s = 1 - 0.15 * k
-        p.scale(s, s)
-        paint.draw_text(p, 0, 0, "bramble", look.BRAND_PX, look.alpha(look.TEXT, self.brand_a.value),
+        x, y = self._brand_origin()
+        paint.draw_text(p, x, y, "bramble", look.BRAND_PX, look.alpha(look.TEXT, self.brand_a.value),
                         look.BRAND_WEIGHT, look.BRAND_TRACK)
-        p.restore()
 
     def _paint_rows(self, p: QPainter) -> None:
         f = paint.font(look.MENU_PX, look.MENU_WEIGHT, look.MENU_TRACK)
+        plus_w = paint.width("+", f)
         for i, r in enumerate(self.rows):
             op = r.op.value
             if op <= 0.002:
@@ -465,61 +490,69 @@ class BrambleWindow(QWidget):
             x = self.x0 + r.x.value
             s = r.scale.value
             hv, on = r.hover.value, r.open.value
+            cy = y + look.ROW / 2
+            if r.cat is None:
+                # the "+" for a new category: invisible until hovered, centred under the
+                # first letter of the name above it
+                above = self.rows[i - 1].label if i else ""
+                cx = self.x0 + look.MARKER_W + paint.first_letter_centre(
+                    above, look.MENU_PX, look.MENU_WEIGHT, look.MENU_TRACK) + r.x.value
+                if self.entry_for != "category":
+                    if hv > 0.01:
+                        p.save()
+                        p.setOpacity(op)
+                        paint.draw_marker(p, cx, cy, look.MENU_PX, 0.0, look.alpha(look.DIM, hv))
+                        p.restore()
+                    if op > 0.5:
+                        self.regions.append((QRectF(cx - 11, y, 22, look.ROW), f"row:{i}",
+                                             lambda r=r: self.toggle(r)))
+                continue
             p.save()
             p.setOpacity(op)
-            cy = y + look.ROW / 2
             p.translate(x, cy)
             p.scale(s, s)
             p.translate(-x, -cy)
             ty = cy - paint.text_height(f) / 2
-            opened = r is self.open_row or (r is self.shown_row and not self.timeline.shut)
-            mark = "−" if r is self.open_row else "+"
             mcol = look.mix(look.FAINT, look.DIM, max(r.mark.value, on))
-            paint.draw_text(p, x, ty, mark, look.MENU_PX, mcol, look.MENU_WEIGHT)
-            tw = 0.0
-            if r.label:
-                col = look.mix(look.FAINT, look.TEXT, max(hv, on))
-                tw = paint.draw_text(p, x + look.MARKER_W, ty, r.label, look.MENU_PX, col,
-                                     look.MENU_WEIGHT, look.MENU_TRACK, glow=hv)
+            paint.draw_marker(p, x + plus_w / 2, cy, look.MENU_PX, r.turn.value, mcol)
+            col = look.mix(look.FAINT, look.TEXT, max(hv, on))
+            tw = paint.draw_text(p, x + look.MARKER_W, ty, r.label, look.MENU_PX, col,
+                                 look.MENU_WEIGHT, look.MENU_TRACK, glow=hv)
             p.restore()
-            if op > 0.5 and not (self.entry_for == "category" and r.cat is None):
+            if op > 0.5 and not self.returning:
                 hit = QRectF(x - 4, y, (look.MARKER_W + tw) * s + 10, look.ROW)
                 self.regions.append((hit, f"row:{i}", lambda r=r: self.toggle(r)))
 
-    def _paint_lines_and_card(self, p: QPainter) -> None:
-        geo = self._card_geometry()
-        if geo is None or self.timeline.shut:
+    def _paint_card(self, p: QPainter) -> None:
+        card = self._card_geometry()
+        if card is None or self.timeline.shut:
             return
-        ly, lx0, cx, card = geo
-        tl = self.timeline
-        across = tl.part(look.LINE_ACROSS)
-        down = tl.part(look.LINE_DOWN)
-        unfold = tl.part(look.CARD_OPEN)
-        text = tl.part(look.CARD_TEXT)
+        unfold = self.timeline.part(look.CARD_OPEN)
+        text = self.timeline.part(look.CARD_TEXT)
+        if unfold <= 0.002:
+            return
+        # it opens downward out of the space under the chosen line
+        r = QRectF(card.left(), card.top(), card.width(), card.height() * unfold)
         p.save()
-        if across > 0.002:
-            p.fillRect(QRectF(lx0, ly, (cx - lx0) * across, 1), look.LINE)
-        bottom = card.top() - look.LINE_GAP
-        if down > 0.002:
-            p.fillRect(QRectF(cx, ly, 1, (bottom - ly) * down + 1), look.LINE)
-        if unfold > 0.002:
-            # the card opens out of the corner the lines point at
-            x0 = cx + (card.left() - cx) * unfold
-            x1 = cx + (card.right() - cx) * unfold
-            y0 = card.top()
-            y1 = card.top() + card.height() * unfold
-            r = QRectF(x0, y0, x1 - x0, y1 - y0)
-            p.setClipPath(paint.rounded(r), Qt.ClipOperation.IntersectClip)
-            self.bg.paint(p, r, look.GLASS_SCRIM)
-            if self.panel:
-                self.panel.paint(p, card, text, look.SLIDE * (1 - text))
-                if text > 0.5:
-                    self.regions.extend(self.panel.regions)
+        p.setOpacity(unfold)
+        # depth: a soft shadow under it, so it reads as a second window above the first
+        for k in range(look.SHADOW, 0, -1):
+            a = 0.05 * (1 - k / (look.SHADOW + 1))
+            p.fillPath(paint.rounded(r.adjusted(-k, -k + 2, k, k + 2), look.RADIUS + k),
+                       QColor(0, 0, 0, int(255 * a)))
+        p.setClipPath(paint.rounded(r), Qt.ClipOperation.IntersectClip)
+        self.bg.paint(p, r, look.GLASS_SCRIM, blur=True)
+        p.setOpacity(1.0)
+        if self.panel:
+            self.panel.paint(p, card, text, look.SLIDE * (1 - text))
+            if text > 0.5:
+                self.regions.extend(self.panel.regions)
         p.restore()
 
     def _paint_close(self, p: QPainter, w: float) -> None:
         cell = QRectF(w - look.CLOSE_CELL, 0, look.CLOSE_CELL, look.CLOSE_CELL)
-        col = look.mix(look.FAINT, look.TEXT, self.close_hover.value)
+        # invisible until hovered, as Hawthorn's
+        col = look.alpha(look.TEXT, self.close_hover.value)
         f = paint.font(13)
         tw = paint.width("×", f)
         paint.draw_text(p, cell.center().x() - tw / 2, cell.center().y() - paint.text_height(f) / 2,
@@ -579,6 +612,10 @@ class BrambleWindow(QWidget):
             return
         if self.entry.isVisible() and self.entry_for == "category":
             self.hide_entry()
+        card = self._card_geometry()
+        if self.panel and self.panel.mode != "list" and (card is None or not card.contains(pos)):
+            self.panel.cancel_adding()
+            return
         edges = self._edges(pos)
         handle = self.windowHandle()
         if edges and handle:
@@ -587,8 +624,8 @@ class BrambleWindow(QWidget):
             handle.startSystemMove()
 
     def wheelEvent(self, ev) -> None:
-        geo = self._card_geometry()
-        if self.panel and geo and geo[3].contains(ev.position()):
+        card = self._card_geometry()
+        if self.panel and card and card.contains(ev.position()):
             self.panel.wheel(ev.angleDelta().y() / 120 * look.ROW * 2)
 
     def keyPressEvent(self, ev) -> None:

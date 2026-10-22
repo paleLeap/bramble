@@ -17,8 +17,8 @@ TEXT = QColor("#e8eaee")
 DIM = QColor("#8d94a2")
 FAINT = QColor("#565d6b")
 GLOW = QColor(232, 234, 238, int(0.22 * 255))        # the hover halo
-TEXT_SOFT = 0.72                                      # the name, at rest
-TEXT_GHOST = 0.40                                     # the name, once something is open
+TEXT_SOFT = 0.55                                      # the name, at rest (user: fainter than the site's 0.72)
+TEXT_GHOST = 0.35                                     # the name, once something is open
 BAD = QColor("#c98a7a")                               # Hawthorn .state.bad
 ERR_TEXT = QColor("#f0c4b8")                          # Hawthorn .errline
 ERR_FILL = QColor(227, 160, 143, int(0.12 * 255))     # Hawthorn .errmark
@@ -76,12 +76,15 @@ MARK_MS = 220           # the marker's colour
 BRAND_MS = 1000
 PANEL_IN_MS = 560
 PANEL_OUT_MS = 380
-# Hawthorn's corner-line timeline, seconds: across, down, the card, its contents.
-LINE_ACROSS = (0.00, 0.28)
-LINE_DOWN = (0.28, 0.52)
-CARD_OPEN = (0.52, 1.00)
-CARD_TEXT = (0.90, 1.12)
-LINE_GAP = 6            # the lines stop this short of the card
+# Opening a category, seconds: the other lines leave first (FADE_MS), then the card
+# opens out of the space under the chosen line, then its contents slide in. Closing
+# plays the same timeline backwards, and the lines only return once the card is gone.
+CARD_OPEN = (0.42, 0.86)
+CARD_TEXT = (0.74, 0.98)
+CARD_MARGIN = 22        # the card sits this far in from both sides of the window
+CARD_PAD = 14
+BLUR = 10               # how far the card's view of the background is shrunk to blur it
+SHADOW = 10             # px of soft shadow around the card
 
 
 def _bezier(x1: float, y1: float, x2: float, y2: float):

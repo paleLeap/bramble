@@ -37,6 +37,7 @@ class Background:
         self.sources = [BG_DIR / n for n in ORDER if (BG_DIR / n).exists()]
         self.raw = [QPixmap(str(p)) for p in self.sources]
         self.sized: list[QPixmap] = []
+        self.blurred: list[QPixmap] = []      # the same, heavily blurred, for the card
         self.size = QSizeF(0, 0)
         self.born = anim.now()
         self.at = 0
@@ -66,8 +67,21 @@ class Background:
                                  Qt.AspectRatioMode.IgnoreAspectRatio,
                                  Qt.TransformationMode.SmoothTransformation))
         self.sized = out
+        # Blur by shrinking hard and scaling back up, twice, so it stays smooth.
+        soft = []
+        for pm in out:
+            w1, h1 = max(1, pm.width() // look.BLUR), max(1, pm.height() // look.BLUR)
+            small = pm.scaled(w1 * 3, h1 * 3, Qt.AspectRatioMode.IgnoreAspectRatio,
+                              Qt.TransformationMode.SmoothTransformation)
+            small = small.scaled(w1, h1, Qt.AspectRatioMode.IgnoreAspectRatio,
+                                 Qt.TransformationMode.SmoothTransformation)
+            mid = small.scaled(w1 * 3, h1 * 3, Qt.AspectRatioMode.IgnoreAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
+            soft.append(mid.scaled(pm.width(), pm.height(), Qt.AspectRatioMode.IgnoreAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation))
+        self.blurred = soft
 
-    def paint(self, p: QPainter, rect: QRectF, scrim: float = look.SCRIM) -> None:
+    def paint(self, p: QPainter, rect: QRectF, scrim: float = look.SCRIM, blur: bool = False) -> None:
         """Fill `rect` (window coordinates) with the pictures and the scrim. The
         pictures are laid out against the whole window, so a smaller rect shows the
         same picture continuing, as Hawthorn's cards do."""
@@ -79,7 +93,7 @@ class Background:
             t = anim.now() - self.born
             p.save()
             p.setClipRect(rect, Qt.ClipOperation.IntersectClip)
-            for i, pm in enumerate(self.sized):
+            for i, pm in enumerate(self.blurred if blur else self.sized):
                 a = self.fades[i].value
                 if a <= 0.002:
                     continue

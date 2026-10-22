@@ -1,9 +1,10 @@
 """What an opened category shows inside its card.
 
-A list of cleaned-up titles. Clicking one shows its info (a small thumbnail and
-the stats behind it); clicking it again plays it. TV shows are "+ show" lines
-that open onto their episodes, as Hawthorn's lines open onto theirs. The last
-line is "+": paste a link or pick a file to add to this category.
+A list of plain names. Hovering one grows it to show a small thumbnail and its
+resolution, length and subtitles; clicking the name or the thumbnail opens it.
+TV shows are "+ show" lines that open onto their episodes. The last line is a
+"+", centred under the first letter of the name above it: paste a link or pick
+a file to add to this category.
 """
 from __future__ import annotations
 
@@ -13,22 +14,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from PyQt6.QtCore import QPointF, QRectF, Qt
-from PyQt6.QtGui import QImage, QPainter, QPen
+from PyQt6.QtCore import QRectF, Qt
+from PyQt6.QtGui import QColor, QFontMetricsF, QImage, QPainter
 
-from .. import checks, guide, kinds, launcher, probe
+from .. import checks, guide, probe
 from ..library import Item
 from . import anim, look, paint
 
 ROW = look.ROW
-
-
-def human_size(n: float) -> str:
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            return f"{n:.0f} {unit}" if unit in ("B", "KB", "MB") else f"{n:.1f} {unit}"
-        n /= 1024
-    return ""
+LINE_H = 16          # one line of info text
+THUMB_W = 128
 
 
 def duration(secs: float) -> str:
@@ -44,8 +39,10 @@ class Entry:
     item: Item | None = None
     children: list["Entry"] = field(default_factory=list)   # a show's episodes
     depth: int = 0
-    download: object | None = None                           # downloads.Job
+    download: object | None = None                           # downloads.Job or CopyJob
     hover: anim.Prop = field(default_factory=lambda: anim.Prop(0.0, look.COLOR_MS, look.css_ease))
+    grow: anim.Prop = field(default_factory=lambda: anim.Prop(0.0, look.MOVE_MS))   # px of info shown
+    turn: anim.Prop = field(default_factory=lambda: anim.Prop(0.0, look.MOVE_MS))   # + -> -
 
     @property
     def group(self) -> bool:
@@ -54,14 +51,15 @@ class Entry:
 
 @dataclass
 class Info:
-    """What the first click shows."""
-    lines: list[str] = field(default_factory=list)
+    """What hovering shows."""
+    line: str = ""
     thumb: QImage | None = None
     issues: list[checks.Issue] = field(default_factory=list)
     hint: str = ""
     error: list[str] = field(default_factory=list)          # after a failed open
     error_fixes: list[checks.Fix] = field(default_factory=list)
     busy: bool = False
+    loaded: bool = False
     pr: probe.Probe | None = None
 
 
@@ -71,64 +69,39 @@ def _plain(html: str) -> str:
     return re.sub(r"\s+", " ", text).replace("&gt;", ">").replace("&lt;", "<").strip()
 
 
-def stat_lines(item: Item, pr: probe.Probe | None) -> list[str]:
-    out: list[str] = []
+def info_line(item: Item, pr: probe.Probe | None) -> str:
+    """Resolution, length, subtitles (user, 2026-10-22: nothing else)."""
     k = item.kind
+    bits: list[str] = []
     if k in ("movie", "episode") and pr and pr.ok:
-        first = []
-        if item.episode:
-            first.append(f"S{item.episode.season:02d}E{item.episode.number:02d}")
-        if item.year:
-            first.append(item.year)
         if pr.resolution:
-            first.append(pr.resolution + (" HDR" if pr.hdr else ""))
+            bits.append(pr.resolution)
         if pr.duration:
-            first.append(duration(pr.duration))
-        out.append("  ·  ".join(first))
-        second = []
-        if pr.audio:
-            a = pr.audio[0]
-            ch = {1: "mono", 2: "stereo", 6: "5.1", 8: "7.1"}.get(a["channels"], f"{a['channels']} ch")
-            second.append(f"{a['codec'].upper()} {ch}")
-        langs = sorted({(s.language or "?")[:3].lower() for s in pr.subs})
-        if langs:
-            second.append("subtitles " + ", ".join(langs))
-        elif item.sidecar_subs:
-            second.append("subtitles beside it")
-        if second:
-            out.append("  ·  ".join(second))
-    elif k == "music":
-        bits = [b for b in (item.album, duration(pr.duration) if pr and pr.ok and pr.duration else "") if b]
-        if bits:
-            out.append("  ·  ".join(bits))
+            bits.append(duration(pr.duration))
+        if pr.subs or item.sidecar_subs:
+            bits.append("subtitles")
+    elif k == "music" and pr and pr.ok and pr.duration:
+        bits.append(duration(pr.duration))
     elif k == "rom" and item.system:
-        out.append(item.system.name)
-    elif k == "game_windows":
-        out.append("windows")
-    elif k == "game_linux":
-        out.append("linux")
-    elif item.year:
-        out.append(item.year)
-    out.append(human_size(item.size))
-    return [l for l in out if l]
+        bits.append(item.system.name)
+    return "  ·  ".join(bits)
 
 
 class Panel:
     """Lays out and draws an open category's card contents; answers its clicks."""
 
     def __init__(self, host, category):
-        self.host = host                      # the window: repaint, run(), settings, play()
+        self.host = host
         self.category = category
         self.entries: list[Entry] = []
         self.open_groups: set[str] = set()
-        self.selected: str | None = None
         self.infos: dict[str, Info] = {}
         self.scroll = 0.0
         self.content_h = 0.0
+        self.view_h = 0.0
         self.mode = "list"                    # list, adding, picking
         self.pick_dir: Path = Path.home()
         self.pick_rows: list[tuple[str, Path | None]] = []
-        self.pick_hover = anim.Prop(0.0)
         self.hover_key: str | None = None
         self.add_hover = anim.Prop(0.0, look.MARK_MS, look.css_ease)
         self.close_hover = anim.Prop(0.0, look.COLOR_MS, look.css_ease)
@@ -136,26 +109,25 @@ class Panel:
 
     # --- content ------------------------------------------------------------------
     def set_items(self, items: list[Item], jobs: list) -> None:
-        old_hover = {e.key: e.hover for e in self._walk(self.entries)}
+        old = {e.key: e for e in self._walk(self.entries)}
         entries: list[Entry] = []
         if self.category.kind == "tv":
             shows: dict[str, list[Item]] = {}
             for it in items:
-                show = it.episode.show if it.episode else it.title
-                shows.setdefault(show, []).append(it)
+                shows.setdefault(it.episode.show if it.episode else it.title, []).append(it)
             for show in sorted(shows, key=str.lower):
                 eps = sorted(shows[show], key=lambda i: ((i.episode.season, i.episode.number)
                                                          if i.episode else (0, 0), i.title))
-                kids = [Entry(it.key, it.display, it, depth=1) for it in eps]
+                kids = [Entry(it.key, it.display if it.episode else it.title, it, depth=1) for it in eps]
                 entries.append(Entry("show:" + show, show, None, kids))
         else:
-            for it in sorted(items, key=lambda i: i.display.lower()):
-                entries.append(Entry(it.key, it.display, it))
+            for it in sorted(items, key=lambda i: i.title.lower()):
+                entries.append(Entry(it.key, it.title, it))
         for job in jobs:
             entries.append(Entry("job:" + job.id, job.title, None, download=job))
         for e in self._walk(entries):
-            if e.key in old_hover:
-                e.hover = old_hover[e.key]
+            if e.key in old:                  # keep animations running across a rescan
+                e.hover, e.grow, e.turn = old[e.key].hover, old[e.key].grow, old[e.key].turn
         self.entries = entries
 
     @staticmethod
@@ -173,8 +145,9 @@ class Panel:
         return out
 
     def moving(self) -> bool:
-        return (any(e.hover.moving for e in self._walk(self.entries)) or self.add_hover.moving
-                or self.close_hover.moving or any(i.busy for i in self.infos.values())
+        return (any(e.hover.moving or e.grow.moving or e.turn.moving for e in self._walk(self.entries))
+                or self.add_hover.moving or self.close_hover.moving
+                or any(i.busy for i in self.infos.values())
                 or any(e.download and not e.download.finished for e in self.entries))
 
     # --- clicks -----------------------------------------------------------------
@@ -182,22 +155,19 @@ class Panel:
         if e.group:
             if e.key in self.open_groups:
                 self.open_groups.discard(e.key)
+                e.turn.set(0.0)
             else:
                 self.open_groups.add(e.key)
+                e.turn.set(1.0)
             return
-        if e.download is not None:
-            self.selected = None if self.selected == e.key else e.key
-            return
-        if self.selected == e.key and e.item is not None:
-            self.host.play(e.item, self)          # second click: play
-            return
-        self.selected = e.key
-        if e.item is not None and e.key not in self.infos:
-            self._load_info(e.item)
+        if e.item is not None:
+            self.host.play(e.item, self)
 
     def _load_info(self, item: Item) -> None:
-        info = Info(busy=True)
-        self.infos[item.key] = info
+        info = self.infos.setdefault(item.key, Info())
+        if info.loaded or info.busy:
+            return
+        info.busy = True
 
         def work():
             from .. import thumbs
@@ -209,24 +179,21 @@ class Panel:
 
         def done(res, err):
             info.busy = False
+            info.loaded = True
             if err or res is None:
-                info.lines = stat_lines(item, None)
                 return
             pr, thumb, issues = res
             info.pr = pr
-            info.lines = stat_lines(item, pr)
+            info.line = info_line(item, pr)
             info.thumb = QImage(str(thumb)) if thumb else None
             info.issues = issues
-            hints = [f.guide for i in issues for f in i.fixes if f.guide]
-            if hints and hints[0] in guide.BY_ID:
-                info.hint = _plain(guide.BY_ID[hints[0]].body)
         self.host.run(work, done)
 
     def opened(self, item: Item, outcome) -> None:
         info = self.infos.setdefault(item.key, Info())
         info.busy = False
         if outcome.ok:
-            info.error, info.error_fixes = [], []
+            info.error, info.error_fixes, info.hint = [], [], ""
             return
         info.error = [f"{a.way}: {a.detail or 'did not start'}" for a in outcome.attempts]
         info.error_fixes = [f for i in checks.after_failure(item, outcome) for f in i.fixes
@@ -234,30 +201,38 @@ class Panel:
         info.hint = _plain(guide.BY_ID["nothing-opens"].body)
 
     # --- layout and drawing -------------------------------------------------------
+    def natural_height(self) -> float:
+        """How tall the card wants to be for what it holds now (padding included)."""
+        return self.content_h + 2 * look.CARD_PAD
+
     def paint(self, p: QPainter, card: QRectF, opacity: float, shift: float) -> None:
         """Draw inside `card` (already clipped). shift slides the contents in from the right."""
         self.regions = []
-        if opacity <= 0.002:
-            return
         p.save()
         p.setOpacity(opacity)
-        inner = card.adjusted(14, 12, -14, -12)
-        # the card's own close mark, top right
+        inner = card.adjusted(look.CARD_PAD, look.CARD_PAD, -look.CARD_PAD, -look.CARD_PAD)
+        # the card's own close mark, top right: invisible until hovered (as Hawthorn's)
         cx = QRectF(card.right() - 26, card.top() + 2, 24, 22)
-        p.setOpacity(opacity)
-        c = look.mix(look.FAINT, look.TEXT, self.close_hover.value)
-        paint.draw_text(p, cx.left() + 7, cx.top() + 3, "×", 13, c)
-        self.regions.append((cx, "card-close", self.host.close_category))
-        p.setClipRect(inner.adjusted(-8, 0, 8, 0), Qt.ClipOperation.IntersectClip)
+        if self.close_hover.value > 0.01:
+            paint.draw_text(p, cx.left() + 7, cx.top() + 3, "×", 13,
+                            look.alpha(look.TEXT, self.close_hover.value))
+        if opacity > 0.5:
+            self.regions.append((cx, "card-close", self.host.close_category))
+        p.setClipRect(inner.adjusted(-8, -4, 8, 4), Qt.ClipOperation.IntersectClip)
         x0 = inner.left() + shift
         y = inner.top() - self.scroll
         width = inner.width() - 18
         if self.mode == "picking":
             y = self._paint_picker(p, x0, y, width, inner)
         else:
+            last_title = ""
+            last_x = x0
             for e in self.visible():
                 y = self._paint_entry(p, e, x0, y, width, inner)
-            y = self._paint_add(p, x0, y, width, inner)
+                last_title, last_x = e.title, x0 + e.depth * look.HANG
+                if e.group:
+                    last_x += look.MARKER_W
+            y = self._paint_add(p, x0, last_x, last_title, y, width, inner)
         self.content_h = y + self.scroll - inner.top()
         self.view_h = inner.height()
         p.restore()
@@ -265,86 +240,129 @@ class Panel:
     def _paint_entry(self, p, e: Entry, x0, y, width, inner) -> float:
         x = x0 + e.depth * look.HANG
         h = e.hover.value
-        sel = self.selected == e.key
+        top = y
         if e.group:
-            opened = e.key in self.open_groups
-            mark = "−" if opened else "+"
-            mcol = look.mix(look.FAINT, look.DIM, max(h, 1.0 if opened else 0.0))
-            col = look.TEXT if opened else look.mix(look.FAINT, look.TEXT, h)
-            paint.draw_text(p, x, y + 3, mark, look.LIST_PX, mcol)
+            mcol = look.mix(look.FAINT, look.DIM, max(h, e.turn.value))
+            f = paint.font(look.LIST_PX)
+            paint.draw_marker(p, x + paint.width("+", f) / 2, y + ROW / 2, look.LIST_PX,
+                              e.turn.value, mcol)
+            col = look.mix(look.FAINT, look.TEXT, max(h, e.turn.value))
             title = paint.elide(e.title, look.LIST_PX, width - look.MARKER_W)
             tw = paint.draw_text(p, x + look.MARKER_W, y + 3, title, look.LIST_PX, col, glow=h)
-            self._region(QRectF(x, y, look.MARKER_W + tw + 6, ROW), e, inner)
+            self._region(QRectF(x - 4, y, look.MARKER_W + tw + 10, ROW), "entry:" + e.key,
+                         lambda e=e: self.click_entry(e), inner)
             return y + ROW
-        col = look.TEXT if (sel or e.download) else look.mix(look.DIM, look.TEXT, h)
         title = paint.elide(e.title, look.LIST_PX, width - (60 if e.download else 0))
-        tw = paint.draw_text(p, x, y + 3, title, look.LIST_PX, col, glow=max(h, 0.0))
-        self._region(QRectF(x, y, max(tw + 6, 40), ROW), e, inner)
+        col = look.mix(look.DIM, look.TEXT, h)
+        tw = paint.draw_text(p, x, y + 3, title, look.LIST_PX, col, glow=h)
         if e.download is not None:
             job = e.download
-            state = job.state_text
             sc = look.BAD if job.failed else look.FAINT
-            paint.draw_text(p, x + tw + 10, y + 6, state, look.STATE_PX, sc)
-            y += ROW
-            if not job.finished:
-                self._busy(p, x, y - 4)
-                y += 8
-            if sel and job.failed:
-                fixes = []
-                if getattr(job, "needs", ""):
-                    fixes = [checks.Fix(f"Download {job.needs} for Bramble", download=job.needs)]
-                y = self._error_box(p, x, y, width, [job.error], fixes)
-            return y
+            paint.draw_text(p, x + tw + 10, y + 6, job.state_text, look.STATE_PX, sc)
         y += ROW
-        if sel and e.item is not None:
-            y = self._paint_info(p, e.item, x, y, width)
-        return y
+        # what hovering reveals, grown smoothly into its height
+        shown = e.grow.value
+        self._region(QRectF(x - 4, top, max(tw + 10, width * 0.6), ROW + shown), "entry:" + e.key,
+                     lambda e=e: self.click_entry(e), inner)
+        expanded = self._expanded(e)
+        if e.item is not None and expanded:
+            self._load_info(e.item)
+        if e.download is not None and not e.download.finished:
+            self._busy(p, x, y - 4)
+            y += 6
+        want = self._info_height(e, width) if expanded else 0.0
+        e.grow.set(want)
+        if shown > 0.5:
+            p.save()
+            p.setClipRect(QRectF(x - 8, y, width + 16, shown), Qt.ClipOperation.IntersectClip)
+            full = max(want, e.grow.a, 1.0)
+            p.setOpacity(p.opacity() * look.clamp(shown / full))
+            self._paint_info(p, e, x, y, width)
+            p.restore()
+        return y + shown
 
-    def _paint_info(self, p, item: Item, x, y, width) -> float:
-        info = self.infos.get(item.key)
-        if info is None:
-            return y
+    def _expanded(self, e: Entry) -> bool:
+        k = self.hover_key or ""
+        return k == "entry:" + e.key or k.startswith(f"fix:{e.key}:")
+
+    def _info_height(self, e: Entry, width: float) -> float:
+        if e.download is not None:
+            if e.download.failed:
+                return self._error_h([e.download.error], width,
+                                     bool(getattr(e.download, "needs", ""))) + 4
+            return 0.0
+        info = self.infos.get(e.key)
+        if info is None or (not info.loaded and not info.busy):
+            return 0.0
+        h = 2.0
         if info.thumb is not None and not info.thumb.isNull():
-            tw = min(128.0, width * 0.6)
-            th = tw * info.thumb.height() / max(1, info.thumb.width())
-            p.drawImage(QRectF(x, y + 2, tw, th), info.thumb)
-            y += th + 8
-        for line in info.lines:
-            for chunk in self._wrap(line, look.NOTE_PX, width):
-                paint.draw_text(p, x, y, chunk, look.NOTE_PX, look.FAINT)
-                y += 16
-        y += 6
+            tw = min(THUMB_W, width * 0.6)
+            h += tw * info.thumb.height() / max(1, info.thumb.width()) + 6
+        if info.line:
+            h += LINE_H
         if info.busy:
-            self._busy(p, x, y)
+            h += 10
+        for iss in info.issues:
+            h += self._error_h([iss.title], width, any(not f.guide for f in iss.fixes))
+        if info.error:
+            h += self._error_h(info.error, width, bool(info.error_fixes))
+            if info.hint:
+                h += 17 * len(self._wrap(info.hint, 12, width)) + 4
+        return h + 8
+
+    def _paint_info(self, p, e: Entry, x, y, width) -> None:
+        if e.download is not None:
+            if e.download.failed:
+                needs = getattr(e.download, "needs", "")
+                fixes = [checks.Fix(f"Download {needs} for Bramble", download=needs)] if needs else []
+                self._error_box(p, e, x, y + 2, width, [e.download.error], fixes, None)
+            return
+        info = self.infos.get(e.key)
+        if info is None:
+            return
+        y += 2
+        if info.thumb is not None and not info.thumb.isNull():
+            tw = min(THUMB_W, width * 0.6)
+            th = tw * info.thumb.height() / max(1, info.thumb.width())
+            r = QRectF(x, y, tw, th)
+            p.drawImage(r, info.thumb)
+            # the thumbnail opens it too
+            self.regions.append((r, "entry:" + e.key, lambda e=e: self.click_entry(e)))
+            y += th + 6
+        if info.line:
+            paint.draw_text(p, x, y, info.line, look.NOTE_PX, look.FAINT)
+            y += LINE_H
+        if info.busy:
+            self._busy(p, x, y + 4)
             y += 10
         for iss in info.issues:
             fixes = [f for f in iss.fixes if not f.guide]
-            y = self._error_box(p, x, y, width, [iss.title], fixes, item)
+            y = self._error_box(p, e, x, y, width, [iss.title], fixes, e.item)
         if info.error:
-            y = self._error_box(p, x, y, width, info.error, info.error_fixes, item)
-        if info.hint and (info.error or info.issues):
-            for chunk in self._wrap(info.hint, 12, width):
-                paint.draw_text(p, x, y, chunk, 12, look.DIM)
-                y += 17
-            y += 4
-        return y + 6
+            y = self._error_box(p, e, x, y, width, info.error, info.error_fixes, e.item)
+            if info.hint:
+                for chunk in self._wrap(info.hint, 12, width):
+                    paint.draw_text(p, x, y, chunk, 12, look.DIM)
+                    y += 17
 
-    def _error_box(self, p, x, y, width, lines: list[str], fixes, item: Item | None = None) -> float:
+    def _error_h(self, lines, width, has_fixes) -> float:
+        n = sum(len(self._wrap(l, 12, width - 16)) for l in lines)
+        return 8 + 17 * n + (18 if has_fixes else 0) + 8
+
+    def _error_box(self, p, e: Entry, x, y, width, lines: list[str], fixes, item) -> float:
+        """Hawthorn's .errmark: a faint rose box with a 2px edge, the reason, then fixes."""
         wrapped = [c for l in lines for c in self._wrap(l, 12, width - 16)]
-        h = 8 + 17 * len(wrapped)
-        if fixes:
-            h += 18
-        box = QRectF(x, y + 2, width, h)
-        p.fillRect(box, look.ERR_FILL)
+        h = 8 + 17 * len(wrapped) + (18 if fixes else 0)
+        p.fillRect(QRectF(x, y + 2, width, h), look.ERR_FILL)
         p.fillRect(QRectF(x, y + 2, 2, h), look.ERR_EDGE)
         ty = y + 6
         for c in wrapped:
             paint.draw_text(p, x + 8, ty, c, 12, look.ERR_TEXT)
             ty += 17
         fx = x + 8
-        for f in fixes:
+        for i, f in enumerate(fixes):
             label = f.label[0].lower() + f.label[1:]
-            key = f"fix:{id(f)}"
+            key = f"fix:{e.key}:{i}"
             hv = 1.0 if self.hover_key == key else 0.0
             w = paint.draw_text(p, fx, ty, label, look.NOTE_PX, look.mix(look.DIM, look.TEXT, hv))
             self.regions.append((QRectF(fx, ty - 2, w + 4, 16), key,
@@ -352,9 +370,10 @@ class Panel:
             fx += w + 14
         return y + h + 8
 
-    def _paint_add(self, p, x0, y, width, inner) -> float:
+    def _paint_add(self, p, x0, last_x, last_title, y, width, inner) -> float:
+        """The "+" that adds a link or a file, centred under the first letter above it."""
         if self.mode == "adding":
-            self.host.place_entry(QRectF(x0, y, width - 40, ROW))
+            self.host.place_entry(QRectF(last_x, y, width - 40 - (last_x - x0), ROW))
             fw = paint.width("file", paint.font(look.NOTE_PX))
             fxr = QRectF(x0 + width - 34, y + 5, fw + 4, 16)
             hv = 1.0 if self.hover_key == "pick" else 0.0
@@ -362,37 +381,35 @@ class Panel:
                             look.mix(look.DIM, look.TEXT, hv))
             self.regions.append((fxr, "pick", self.start_picking))
             return y + ROW
+        cx = last_x + paint.first_letter_centre(last_title, look.LIST_PX)
         h = self.add_hover.value
-        paint.draw_text(p, x0, y + 3, "+", look.LIST_PX, look.mix(look.FAINT, look.DIM, h))
-        r = QRectF(x0 - 4, y, look.MARKER_W + 8, ROW)
-        if inner.contains(r.center()):
+        paint.draw_marker(p, cx, y + ROW / 2, look.LIST_PX, 0.0, look.mix(look.FAINT, look.DIM, h))
+        r = QRectF(cx - 10, y, 20, ROW)
+        if inner.adjusted(-8, -4, 8, 4).contains(r.center()):
             self.regions.append((r, "add", self.start_adding))
         return y + ROW
 
     def _paint_picker(self, p, x0, y, width, inner) -> float:
-        path = str(self.pick_dir)
-        shown = paint.font(look.NOTE_PX)
-        from PyQt6.QtGui import QFontMetricsF
-        path = QFontMetricsF(shown).elidedText(path, Qt.TextElideMode.ElideLeft, width)
+        path = QFontMetricsF(paint.font(look.NOTE_PX)).elidedText(
+            str(self.pick_dir), Qt.TextElideMode.ElideLeft, width)
         paint.draw_text(p, x0, y, path, look.NOTE_PX, look.DIM)
         y += 22
         for i, (name, target) in enumerate(self.pick_rows):
             key = f"pick:{i}"
             hv = 1.0 if self.hover_key == key else 0.0
             is_dir = target is None or target.is_dir()
-            base = look.DIM if is_dir else look.FAINT
-            col = look.mix(base, look.TEXT, hv)
-            t = paint.elide(name, look.LIST_PX, width)
-            w = paint.draw_text(p, x0, y + 3, t, look.LIST_PX, col, glow=hv)
+            col = look.mix(look.DIM if is_dir else look.FAINT, look.TEXT, hv)
+            w = paint.draw_text(p, x0, y + 3, paint.elide(name, look.LIST_PX, width),
+                                look.LIST_PX, col, glow=hv)
             r = QRectF(x0, y, w + 6, ROW)
             if inner.contains(r.center()) and target is not None:
                 self.regions.append((r, key, lambda t=target: self.pick(t)))
             y += ROW
         return y
 
-    def _region(self, r: QRectF, e: Entry, inner: QRectF) -> None:
-        if inner.adjusted(-8, 0, 8, 0).contains(r.center()):
-            self.regions.append((r, "entry:" + e.key, lambda e=e: self.click_entry(e)))
+    def _region(self, r: QRectF, key: str, fn, inner: QRectF) -> None:
+        if inner.adjusted(-8, -4, 8, 4).intersects(r):
+            self.regions.append((r, key, fn))
 
     def _busy(self, p, x, y) -> None:
         """Hawthorn's busy bar: a 22x2 piece easing back and forth along a 90px track."""
@@ -401,7 +418,6 @@ class Panel:
         if phase > 1:
             phase = 2 - phase
         bx = x + (90 - 22) * look.cosine(phase)
-        from PyQt6.QtGui import QColor
         p.fillRect(QRectF(bx, y, 22, 2), QColor(0xe8, 0xea, 0xee, int(0.85 * 255)))
 
     @staticmethod
@@ -423,12 +439,13 @@ class Panel:
     def hover(self, key: str | None) -> None:
         self.hover_key = key
         for e in self._walk(self.entries):
-            e.hover.set(1.0 if key == "entry:" + e.key else 0.0)
+            on = key == "entry:" + e.key or (key or "").startswith(f"fix:{e.key}:")
+            e.hover.set(1.0 if on else 0.0)
         self.add_hover.set(1.0 if key == "add" else 0.0)
         self.close_hover.set(1.0 if key == "card-close" else 0.0)
 
     def wheel(self, dy: float) -> None:
-        most = max(0.0, self.content_h - getattr(self, "view_h", 0) + 8)
+        most = max(0.0, self.content_h - self.view_h + 8)
         self.scroll = max(0.0, min(most, self.scroll - dy))
 
     # --- adding ---------------------------------------------------------------------
@@ -464,13 +481,14 @@ class Panel:
         self.mode = "list"
         self.host.add_file(self.category, target)
 
-    def back(self) -> bool:
-        """Esc inside the card. True if it used the key."""
+    def cancel_adding(self) -> bool:
+        """Leave the text box or the picker. True if there was one."""
         if self.mode in ("adding", "picking"):
             self.mode = "list"
             self.host.hide_entry()
             return True
-        if self.selected:
-            self.selected = None
-            return True
         return False
+
+    def back(self) -> bool:
+        """Esc inside the card. True if it used the key."""
+        return self.cancel_adding()

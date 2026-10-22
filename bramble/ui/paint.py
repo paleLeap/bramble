@@ -104,3 +104,29 @@ def rounded(rect: QRectF, r: float = look.RADIUS) -> QPainterPath:
     r = min(r, rect.width() / 2, rect.height() / 2)
     path.addRoundedRect(rect, r, r)
     return path
+
+
+def draw_marker(p: QPainter, cx: float, cy: float, px: float, turn: float, color: QColor) -> None:
+    """The site's "+" / "\u2212", drawn as two strokes so the upright one can turn.
+    turn 0 is "+", 1 is "\u2212": the upright stroke rotates a quarter turn to lie flat."""
+    import math
+    from PyQt6.QtCore import QLineF
+    from PyQt6.QtGui import QPen
+    arm = px * 0.30
+    pen = QPen(color)
+    pen.setWidthF(max(0.8, px / 15))
+    pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+    p.save()
+    p.setPen(pen)
+    p.drawLine(QLineF(cx - arm, cy, cx + arm, cy))
+    a = math.pi / 2 * (1 - turn)          # upright at 0, flat at 1
+    dx, dy = math.cos(a) * arm, math.sin(a) * arm
+    p.drawLine(QLineF(cx - dx, cy - dy, cx + dx, cy + dy))
+    p.restore()
+
+
+def first_letter_centre(text: str, px: float, weight: int = 200, track: float = 0.0) -> float:
+    """How far in from a word's left edge its first letter's middle sits."""
+    if not text:
+        return px * 0.3
+    return width(text[0], font(px, weight, track)) / 2

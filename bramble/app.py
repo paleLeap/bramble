@@ -72,7 +72,9 @@ def main() -> int:
     app = _qt_app(sys.argv)
 
     # One Bramble per person: a second launch brings the first one forward.
-    key = f"bramble-{getpass.getuser()}"
+    # (keyed on the settings folder too, so a copy run with other settings is its own)
+    import hashlib
+    key = f"bramble-{getpass.getuser()}-" + hashlib.sha1(str(paths.config_dir()).encode()).hexdigest()[:8]
     sock = QLocalSocket()
     sock.connectToServer(key)
     if sock.waitForConnected(300):
