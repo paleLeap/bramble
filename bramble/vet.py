@@ -153,14 +153,15 @@ def check(root: Path) -> Verdict:
     return v
 
 
-def file_into_library(root: Path, v: Verdict, marrow: Path) -> Path:
-    """Move what passed into the right category folder; returns where it went.
-    Films keep their own folder (as torrents make them) unless they are a single file."""
+def file_into_library(root: Path, v: Verdict, marrow: Path, into: Path | None = None) -> Path:
+    """Move what passed into the right category folder (or `into`, when it was added to
+    a particular category); returns where it went. Films keep their own folder (as
+    torrents make them) unless they are a single file."""
     category = kinds.CATEGORY_FOR_KIND.get(v.kind, "Other")
     if category in ("Programs", "Other"):
         category = "Other"
-    dest_root = marrow / category
-    if v.kind in ("episode", "rom", "game_windows", "game_linux"):
+    dest_root = into if into is not None else marrow / category
+    if into is None and v.kind in ("episode", "rom", "game_windows", "game_linux"):
         main = max(v.keep, key=lambda p: p.stat().st_size)
         for part in kinds.suggested_subfolder(Path(main.name), v.kind if v.kind != "game_windows" else "x"):
             dest_root = dest_root / part

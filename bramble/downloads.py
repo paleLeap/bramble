@@ -1,8 +1,8 @@
 """Downloading what someone pastes: torrent files, magnet links, direct links.
 
-Bramble does it itself with aria2 (carried on the drive, or on the PC), straight
-into the category's folder. Unfinished downloads are remembered and resumed the
-next time Bramble opens (aria2 --continue picks up where it stopped).
+Bramble runs the torrent programs itself: its own qBittorrent first (in the
+background, see qbit.py), aria2 when qBittorrent cannot start or fails. Unfinished
+downloads are remembered and resumed the next time Bramble opens.
 """
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,6 +72,9 @@ class Job:
     kind: str = ""
     speed: str = ""                  # "3.2MiB" a second, from aria2's readout
     eta: str = ""                    # "6m12s"
+    into: Path | None = None         # file into this folder (a category's "+"), not by kind
+    engine: str = ""                 # "qBittorrent" or "aria2"
+    waiting: bool = False            # nobody is sharing it (yet)
 
     @property
     def state_text(self) -> str:
@@ -80,6 +84,8 @@ class Job:
             return self.stage
         if self.finished:
             return "done"
+        if self.waiting:
+            return "waiting for someone sharing it"
         return f"{self.percent}%" if self.percent >= 0 else "starting"
 
 
@@ -103,30 +109,113 @@ class Downloads:
             if folder.is_dir():
                 self.start(d["link"], folder, remember=False,
                            marrow=Path(d["marrow"]) if d.get("marrow") else None,
-                           title=d.get("title", ""))
+                           title=d.get("title", ""), into=Path(d["into"]) if d.get("into") else None)
 
     def _remember(self) -> None:
         self.settings["downloads"] = [
             {"link": j.link, "folder": str(j.folder), "title": j.title,
-             **({"marrow": str(j.marrow)} if j.marrow else {})}
+             **({"marrow": str(j.marrow)} if j.marrow else {}),
+             **({"into": str(j.into)} if j.into else {})}
             for j in self.jobs if not j.finished]
 
     def start(self, link: str, folder: Path, remember: bool = True, marrow: Path | None = None,
-              title: str = "") -> Job:
+              title: str = "", into: Path | None = None) -> Job:
         """Download into `folder`. With `marrow`, `folder` is a holding folder: when the
-        download finishes it is checked (vet.py) and filed into that library."""
-        job = Job(link.strip(), folder, title or title_of(link), marrow=marrow)
+        download finishes it is checked (vet.py) and filed into that library (or `into`)."""
+        job = Job(link.strip(), folder, title or title_of(link), marrow=marrow, into=into)
         self.jobs.append(job)
         if remember:
             self._remember()
+        folder.mkdir(parents=True, exist_ok=True)
+        threading.Thread(target=self._run, args=(job,), daemon=True).start()
+        return job
+
+    def _run(self, job: Job) -> None:
+        """qBittorrent first; aria2 if it cannot start, will not take the link, or fails."""
+        from . import qbit
+        why = ""
+        try:
+            q = qbit.get()
+            job.engine = "qBittorrent"
+            if self._follow_qbit(job, q):
+                return
+            why = job.error
+        except OSError as e:
+            why = str(e)
+        job.failed = job.finished = False
+        job.error, job.percent, job.engine = "", -1, ""
+        self._start_aria2(job, why)
+
+    def _follow_qbit(self, job: Job, q) -> bool:
+        """Add the torrent and watch it to the end. False if qBittorrent gave up on it."""
+        import hashlib
+        tag = "bramble-" + hashlib.sha1(job.link.encode()).hexdigest()[:12]
+        if q.info(tag) is None:
+            try:
+                q.add(job.link, job.folder, tag)
+            except OSError as e:
+                job.error = str(e)
+                return False
+        seen_at = time.monotonic()
+        stalled_since = None
+        done_states = {"uploading", "stalledUP", "pausedUP", "stoppedUP", "queuedUP", "forcedUP"}
+        while True:
+            time.sleep(1)
+            try:
+                t = q.info(tag)
+            except OSError:
+                if not q.alive():
+                    job.error = "qBittorrent stopped answering."
+                    return False
+                continue
+            if t is None:
+                if time.monotonic() - seen_at > 60:
+                    job.error = "qBittorrent lost track of it."
+                    return False
+                continue
+            seen_at = time.monotonic()
+            state = t.get("state", "")
+            job.percent = int(float(t.get("progress", 0)) * 100)
+            rate = int(t.get("dlspeed", 0))
+            job.speed = _human(rate) if rate else ""
+            eta = int(t.get("eta", 8640000))
+            job.eta = _span(eta) if 0 < eta < 8640000 else ""
+            nobody = state in ("stalledDL", "metaDL") and int(t.get("num_seeds", 0)) == 0 and rate == 0
+            stalled_since = (stalled_since or time.monotonic()) if nobody else None
+            job.waiting = bool(stalled_since and time.monotonic() - stalled_since > 120)
+            if state in ("error", "missingFiles"):
+                job.error = "qBittorrent reported a problem with it."
+                return False
+            if float(t.get("progress", 0)) >= 1.0 or state in done_states:
+                job.percent = 100
+                q.remove(t["hash"], delete_files=False)       # stop sharing; keep the files
+                self._finish(job, ok=True)
+                return True
+
+    def _finish(self, job: Job, ok: bool, code: int = 0, detail: str = "") -> None:
+        if ok:
+            job.percent = 100
+            if job.marrow is not None:
+                self._vet(job)
+            job.finished = True
+        else:
+            job.finished = True
+            job.failed = True
+            job.error = REASONS.get(code, f"aria2 stopped (code {code}).") + (f" {detail}" if detail else "")
+        self._remember()
+        self.on_change(job)
+
+    def _start_aria2(self, job: Job, why: str = "") -> None:
+        folder = job.folder
         cmd = self.aria2()
         if not cmd:
             job.failed, job.finished = True, True
-            job.error = "aria2, the downloader Bramble uses, is not on this PC or the drive."
+            job.error = ("Neither torrent program could run. " + (f"qBittorrent: {why} " if why else "")
+                         + "aria2 is not on this PC or the drive.")
             job.needs = "aria2"
             self._remember()
-            return job
-        folder.mkdir(parents=True, exist_ok=True)
+            self.on_change(job)
+            return
         args = cmd + [f"--dir={folder}", "--continue=true", "--seed-time=0",
                       "--summary-interval=1", "--console-log-level=error",
                       "--enable-color=false",   # (file-allocation=none/trunc stall web-seeded torrents)
@@ -139,9 +228,10 @@ class Downloads:
         except OSError as e:
             job.failed, job.finished, job.error = True, True, str(e)
             self._remember()
-            return job
-        threading.Thread(target=self._watch, args=(job,), daemon=True).start()
-        return job
+            self.on_change(job)
+            return
+        job.engine = "aria2"
+        self._watch(job)
 
     def _watch(self, job: Job) -> None:
         tail: list[str] = []
@@ -157,20 +247,8 @@ class Downloads:
             if line.strip():
                 tail = (tail + [line.strip()])[-6:]
         code = job.proc.wait()
-        if code == 0:
-            job.percent = 100
-            if job.marrow is not None:
-                self._vet(job)
-            job.finished = True
-        else:
-            job.finished = True
-            job.failed = True
-            job.error = REASONS.get(code, f"aria2 stopped (code {code}).")
-            detail = next((t for t in reversed(tail) if "error" in t.lower() or "exception" in t.lower()), "")
-            if detail:
-                job.error += " " + detail[:200]
-        self._remember()
-        self.on_change(job)
+        detail = next((t for t in reversed(tail) if "error" in t.lower() or "exception" in t.lower()), "")
+        self._finish(job, ok=(code == 0), code=code, detail=detail[:200])
 
     def _vet(self, job: Job) -> None:
         """Check what arrived in the holding folder; file it, or hold it with reasons."""
@@ -182,7 +260,7 @@ class Downloads:
             v = vet.check(root)
             job.kind = v.kind
             if v.ok:
-                job.landed = _named(vet.file_into_library(root, v, job.marrow), job.title)
+                job.landed = _named(vet.file_into_library(root, v, job.marrow, into=job.into), job.title)
                 job.stage = "ready"
                 shutil.rmtree(job.folder, ignore_errors=True)   # what is left: site adverts
             else:
@@ -199,7 +277,7 @@ class Downloads:
         root = inside[0] if len(inside) == 1 else job.folder
         v = vet.check(root)
         v.keep = v.keep or [p for p in root.rglob("*") if p.is_file()] if root.is_dir() else [root]
-        job.landed = vet.file_into_library(root, v, job.marrow)
+        job.landed = vet.file_into_library(root, v, job.marrow, into=job.into)
         job.stage, job.reasons = "ready", []
         shutil.rmtree(job.folder, ignore_errors=True)
 
@@ -214,12 +292,14 @@ class Downloads:
         failed = [j for j in self.jobs if j.failed]
         self.jobs = [j for j in self.jobs if not j.failed]
         for j in failed:
-            self.start(j.link, j.folder)
+            self.start(j.link, j.folder, marrow=j.marrow, title=j.title, into=j.into)
 
     def stop_all(self) -> None:
+        from . import qbit
         for j in self.jobs:
             if j.proc and j.proc.poll() is None:
                 j.proc.terminate()
+        qbit.shutdown()
 
     def for_folder(self, folders: list[Path]) -> list[Job]:
         keys = {str(f) for f in folders}
@@ -237,3 +317,17 @@ def _named(path: Path, title: str) -> Path:
         path.rename(target)
         return target
     return path
+
+
+def _human(rate: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if rate < 1024 or unit == "GB":
+            return f"{rate:.0f}{unit}" if unit in ("B", "KB") else f"{rate:.1f}{unit}"
+        rate /= 1024
+    return ""
+
+
+def _span(secs: int) -> str:
+    h, rem = divmod(secs, 3600)
+    m, s_ = divmod(rem, 60)
+    return f"{h}h{m:02d}m" if h else f"{m}m{s_:02d}s" if m else f"{s_}s"

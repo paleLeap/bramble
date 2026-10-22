@@ -78,6 +78,21 @@ class Wing(QWidget):
         self.hover_key: str | None = None
         self.regions: list[tuple[QRectF, str, object]] = []
         self.dl_h = anim.Prop(84.0, look.GROW_MS)
+        self.pasting = False             # the download window is asking for a magnet link
+        from PyQt6.QtWidgets import QLineEdit
+        from PyQt6.QtGui import QPalette
+        self.paste = QLineEdit(self)
+        self.paste.hide()
+        self.paste.setFrame(False)
+        self.paste.setPlaceholderText("paste magnet link")
+        self.paste.setStyleSheet(
+            f"QLineEdit {{ background: transparent; color: {look.TEXT.name()}; border: none;"
+            f" border-bottom: 1px solid {look.FAINT.name()}; padding: 0px; }}")
+        pal = self.paste.palette()
+        pal.setColor(QPalette.ColorRole.PlaceholderText, look.FAINT)
+        self.paste.setPalette(pal)
+        self.paste.setFont(paint.font(look.NOTE_PX + 1))
+        self.paste.returnPressed.connect(self._pasted)
 
     # --- where it sits ------------------------------------------------------------
     def follow(self) -> None:
@@ -122,9 +137,45 @@ class Wing(QWidget):
 
     def open_download(self, result, row_y: float, job) -> None:
         self.chosen, self.chosen_row_y, self.job = result, row_y, job
+        self.pasting = False
+        self.paste.hide()
         self.dl_card.tl.open()
 
+    def open_paste(self, result, row_y: float, prefill: str = "") -> None:
+        """The download window, asking for the link the person copies from the site's page."""
+        self.chosen, self.chosen_row_y, self.job = result, row_y, None
+        self.pasting = True
+        self.paste.setText(prefill)
+        self.dl_card.tl.open()
+
+    def clipboard_changed(self) -> None:
+        """A magnet link copied while the box is waiting goes straight into it (not started)."""
+        if not self.pasting or self.paste.text().strip():
+            return
+        from PyQt6.QtWidgets import QApplication
+        text = QApplication.clipboard().text().strip()
+        if text.startswith("magnet:?") or text.lower().split("?")[0].endswith(".torrent"):
+            self.paste.setText(text)
+            self.main.raise_()
+            self.raise_()
+
+    def _pasted(self) -> None:
+        link = self.paste.text().strip()
+        if not link:
+            return
+        from .. import downloads
+        if not downloads.looks_like_link(link) and not link.startswith("magnet:"):
+            self.paste.clear()
+            self.paste.setPlaceholderText("that is not a magnet or torrent link")
+            return
+        self.pasting = False
+        self.paste.hide()
+        r = self.chosen
+        self.job = self.main.start_link(link, title=r.title if r else "", source_link=r.link if r else "")
+
     def close_download(self) -> None:
+        self.pasting = False
+        self.paste.hide()
         self.dl_card.tl.close()
 
     def moving(self) -> bool:
@@ -288,6 +339,18 @@ class Wing(QWidget):
         title = kinds._tidy(self.chosen.title)
         paint.draw_text(p, x, y, paint.elide(title, look.LIST_PX, width), look.LIST_PX, look.TEXT)
         y += 22
+        if self.pasting:
+            # the box for the link copied from the site's page
+            if live:
+                self.paste.setGeometry(int(x), int(y), int(width), 20)
+                if not self.paste.isVisible():
+                    self.paste.show()
+                    self.activateWindow()
+                    self.paste.setFocus()
+            elif self.paste.isVisible():
+                self.paste.hide()
+            self.dl_h.set(84)
+            return
         if job is None:
             self._busy(p, x, y + 6)
             self.dl_h.set(84)

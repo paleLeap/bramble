@@ -100,4 +100,19 @@ def main() -> int:
     server.newConnection.connect(raise_window)
     win.show()
     logging.info("bramble %s started from %s", __version__, paths.APP_DIR)
+
+    # Whatever way Bramble ends (closed, killed, logged out), its torrent program ends too.
+    from . import qbit
+    import atexit
+    import signal
+    atexit.register(qbit.shutdown)
+    app.aboutToQuit.connect(qbit.shutdown)
+    for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)):
+        if sig is not None:
+            signal.signal(sig, lambda *_: app.quit())
+    # Python only sees signals between Qt events: wake it regularly so a SIGTERM lands.
+    from PyQt6.QtCore import QTimer
+    tick = QTimer()
+    tick.timeout.connect(lambda: None)
+    tick.start(500)
     return app.exec()

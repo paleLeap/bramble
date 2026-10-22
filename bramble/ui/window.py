@@ -102,6 +102,8 @@ class BrambleWindow(QWidget):
         self.downloads = downloads.Downloads(settings, lambda job: self._bridge.done.emit(
             (lambda *_: self._job_ended(job), None, None)))
         self.wing = Wing(self)                   # the search windows, outside to the right
+        from PyQt6.QtWidgets import QApplication
+        QApplication.clipboard().dataChanged.connect(self.wing.clipboard_changed)
         self.notice = ""                         # bottom left: progress, and "... is ready"
         self.notice_a = anim.Prop(0.0, look.COLOR_MS * 2, look.css_ease)
         self.notice_until = 0.0
@@ -305,15 +307,13 @@ class BrambleWindow(QWidget):
             if p.exists() and not text.lower().endswith(".torrent"):
                 self.add_file(cat, p)
             elif downloads.looks_like_link(text):
-                cat.home.mkdir(parents=True, exist_ok=True)
-                self.downloads.start(text, cat.home)
+                self.start_link(text, into=cat.home)
                 self.refresh_panel()
 
     # --- adding files ------------------------------------------------------------------
     def add_file(self, cat: library.Category, src: Path) -> None:
         if src.suffix.lower() == ".torrent":
-            cat.home.mkdir(parents=True, exist_ok=True)
-            self.downloads.start(str(src), cat.home)
+            self.start_link(str(src), into=cat.home)
             self.refresh_panel()
             return
         dest = cat.home
@@ -567,39 +567,32 @@ class BrambleWindow(QWidget):
         p.restore()
 
     def choose_result(self, r, row_y: float) -> None:
-        """A torrent clicked in the results window: download it into the holding folder
-        and show its download window below."""
+        """A result clicked: its page opens in the browser, and the download window offers a
+        box for the magnet link the person copies there. Nothing downloads until they do."""
         existing = next((j for j in self.downloads.jobs if getattr(j, "source_link", "") == r.link), None)
         if existing is not None:
             self.wing.open_download(r, row_y, existing)
             return
-        self.wing.open_download(r, row_y, None)
+        page = r.page or (r.link if r.link.startswith(("http://", "https://"))
+                          and not r.link.lower().split("?")[0].endswith(".torrent") else "")
+        if page:
+            from PyQt6.QtCore import QUrl
+            from PyQt6.QtGui import QDesktopServices
+            QDesktopServices.openUrl(QUrl(page))
+        # no page to open (the source gives the link itself): offer that link instead
+        self.wing.open_paste(r, row_y, prefill="" if page else r.link)
+
+    def start_link(self, link: str, title: str = "", into: Path | None = None, source_link: str = ""):
+        """Every link Bramble downloads goes through here: into a holding folder, then the
+        checks (vet.py), then into the library (or `into`)."""
+        import uuid
         marrow = self._marrow()
-        title = kinds._tidy(r.title)
-
-        def work():
-            return sources.resolve(r)
-
-        def done(link, err):
-            if err or not link:
-                # the site's plugin could not produce a torrent: say so, download nothing
-                job = downloads.Job(r.link, marrow, title, finished=True, failed=True,
-                                    error="The site's plugin could not find a download link for "
-                                          "this one. The plugin may be out of date.")
-                job.source_link = r.link
-                self.downloads.jobs.append(job)
-                if self.wing.chosen is r:
-                    self.wing.job = job
-                return
-            import uuid
-            holding = marrow / ".holding" / uuid.uuid4().hex[:10]
-            holding.mkdir(parents=True, exist_ok=True)
-            job = self.downloads.start(link, holding, marrow=marrow, title=title)
-            job.source_link = r.link
-            if self.wing.chosen is r:
-                self.wing.job = job
-            self._say(f"{title} is downloading")
-        self.run(work, done)
+        holding = marrow / ".holding" / uuid.uuid4().hex[:10]
+        title = kinds._tidy(title) if title else downloads.title_of(link)
+        job = self.downloads.start(link.strip(), holding, marrow=marrow, title=title, into=into)
+        job.source_link = source_link
+        self._say(f"{title} is downloading")
+        return job
 
     def play_landed(self, path: Path) -> None:
         roots = library.library_roots(self.settings)
@@ -1007,7 +1000,7 @@ class BrambleWindow(QWidget):
             if url.isLocalFile():
                 self.add_file(self.panel.category, Path(url.toLocalFile()))
             else:
-                self.downloads.start(url.toString(), self.panel.category.home)
+                self.start_link(url.toString(), into=self.panel.category.home)
         self.refresh_panel()
 
     def closeEvent(self, ev) -> None:

@@ -184,7 +184,34 @@ def _aria2_static(os_key: str) -> Release:
     return Release("aria2", os_key, rel["tag_name"], hit[0], hit[1], "github.com/abcfy2")
 
 
+def _qbt_static(os_key: str) -> Release:
+    if os_key != "linux":
+        raise LookupError("the static build is Linux only")
+    rel = _gh_latest("userdocs/qbittorrent-nox-static")
+    hit = _gh_asset(rel, r"^x86_64-qbittorrent-nox$")
+    if not hit:
+        raise LookupError("no x86_64 qbittorrent-nox")
+    v = re.search(r"(\d+\.\d+\.\d+)", rel["tag_name"])
+    return Release("qbittorrent", os_key, v.group(1) if v else rel["tag_name"], hit[0], hit[1],
+                   "github.com/userdocs")
+
+
+def _qbt_windows(os_key: str) -> Release:
+    if os_key != "windows":
+        raise LookupError("the setup is Windows only")
+    rss = _get("https://sourceforge.net/projects/qbittorrent/rss?path=/qbittorrent-win32")
+    vers = sorted(set(re.findall(r"qbittorrent_(\d+\.\d+\.\d+)_x64_setup\.exe", rss)), key=_vkey)
+    if not vers:
+        raise LookupError("no qBittorrent setup listed")
+    v = vers[-1]
+    fn = f"qbittorrent_{v}_x64_setup.exe"
+    return Release("qbittorrent", os_key, v,
+                   f"https://downloads.sourceforge.net/project/qbittorrent/qbittorrent-win32/"
+                   f"qbittorrent-{v}/{fn}", fn, "sourceforge.net/projects/qbittorrent")
+
+
 SOURCES: dict[str, list[Callable[[str], Release]]] = {
+    "qbittorrent": [_qbt_static, _qbt_windows],
     "aria2": [_aria2_official, _aria2_static],
     "vlc": [_vlc_videolan("https://get.videolan.org/vlc/last/win64/", "get.videolan.org"),
             _vlc_videolan("https://download.videolan.org/pub/videolan/vlc/last/win64/",
@@ -382,6 +409,16 @@ def install(rel: Release, tools_root: Path, progress: Callable[[str], None] | No
             for name in ("ffprobe", "ffmpeg"):
                 exe = name + (".exe" if o == "windows" else "")
                 shutil.copyfile(next(p for p in out.rglob(exe) if p.is_file()), dest / exe)
+        elif t == "qbittorrent":
+            dest = tools_root / "qbittorrent"
+            dest.mkdir(parents=True, exist_ok=True)
+            if o == "linux":
+                shutil.copyfile(file, dest / "qbittorrent-nox")     # one static program
+            else:
+                # the official setup, unpacked (not installed) with 7-Zip: a portable copy
+                _extract(file, out)
+                exe = next(out.rglob("qbittorrent.exe"))
+                _move_contents(exe.parent, dest)
         elif t == "aria2":
             _extract(file, out)
             exe = "aria2c.exe" if o == "windows" else "aria2c"
