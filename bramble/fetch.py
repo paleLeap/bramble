@@ -164,7 +164,28 @@ def _ffmpeg_alt(os_key: str) -> Release:
                    "ffmpeg-release-essentials.zip", "gyan.dev")
 
 
+def _aria2_official(os_key: str) -> Release:
+    if os_key != "windows":
+        raise LookupError("the official aria2 release has no Linux build")
+    rel = _gh_latest("aria2/aria2")
+    hit = _gh_asset(rel, r"win-64bit-build\d+\.zip$")
+    if not hit:
+        raise LookupError("no Windows aria2 build")
+    return Release("aria2", os_key, rel["tag_name"].replace("release-", ""), hit[0], hit[1],
+                   "github.com/aria2")
+
+
+def _aria2_static(os_key: str) -> Release:
+    rel = _gh_latest("abcfy2/aria2-static-build")
+    pat = r"x86_64-linux-musl_static\.zip$" if os_key == "linux" else r"x86_64-w64-mingw32_static\.zip$"
+    hit = _gh_asset(rel, pat)
+    if not hit:
+        raise LookupError("no static aria2 build")
+    return Release("aria2", os_key, rel["tag_name"], hit[0], hit[1], "github.com/abcfy2")
+
+
 SOURCES: dict[str, list[Callable[[str], Release]]] = {
+    "aria2": [_aria2_official, _aria2_static],
     "vlc": [_vlc_videolan("https://get.videolan.org/vlc/last/win64/", "get.videolan.org"),
             _vlc_videolan("https://download.videolan.org/pub/videolan/vlc/last/win64/",
                           "download.videolan.org"),
@@ -354,9 +375,17 @@ def install(rel: Release, tools_root: Path, progress: Callable[[str], None] | No
                 _extract(file, out)
                 shutil.copyfile(next(out.rglob("7za.exe")), dest / "7za.exe")
         elif t == "ffprobe":
+            # one download carries both: ffprobe looks inside files, ffmpeg makes thumbnails
             _extract(file, out)
-            exe = "ffprobe.exe" if o == "windows" else "ffprobe"
             dest = tools_root / "ffmpeg"
+            dest.mkdir(parents=True, exist_ok=True)
+            for name in ("ffprobe", "ffmpeg"):
+                exe = name + (".exe" if o == "windows" else "")
+                shutil.copyfile(next(p for p in out.rglob(exe) if p.is_file()), dest / exe)
+        elif t == "aria2":
+            _extract(file, out)
+            exe = "aria2c.exe" if o == "windows" else "aria2c"
+            dest = tools_root / "aria2"
             dest.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(next(p for p in out.rglob(exe) if p.is_file()), dest / exe)
         else:

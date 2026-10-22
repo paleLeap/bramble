@@ -286,3 +286,77 @@ def scan_inbox(settings, library_items: list[Item]) -> list[Item]:
                 out.append(it)
     out.sort(key=lambda i: i.mtime, reverse=True)
     return out
+
+
+# --- categories (the window's list) ------------------------------------------------
+
+KIND_OF = {"Movies": "movies", "TV Shows": "tv", "Video Games": "games", "Music": "music"}
+
+
+@dataclass
+class Category:
+    name: str                       # the folder's name in MARROW
+    folders: list[Path]             # that folder in every library root that has it
+    home: Path                      # where new things for it go
+
+    @property
+    def label(self) -> str:
+        return self.name.lower()
+
+    @property
+    def kind(self) -> str:
+        return KIND_OF.get(self.name, "custom")
+
+
+def categories(settings) -> list[Category]:
+    """The four, then every other folder found in a MARROW, in name order."""
+    roots = [r for r in library_roots(settings)]
+    home_root = roots[0] if roots else paths.local_marrow()
+    names = list(paths.CATEGORIES)
+    extra: set[str] = set()
+    for r in roots:
+        try:
+            for d in r.iterdir():
+                if d.is_dir() and not d.name.startswith((".", "$")) and d.name not in names:
+                    extra.add(d.name)
+        except OSError:
+            continue
+    names += sorted(extra, key=str.lower)
+    return [Category(n, [r / n for r in roots if (r / n).is_dir()], home_root / n) for n in names]
+
+
+def _scan_any(folder: Path, category: str, root: Path) -> list[Item]:
+    """A category Bramble has no rules for: every file, three folders deep."""
+    items: list[Item] = []
+    base = len(folder.parts)
+    for dirpath, dirnames, files in os.walk(folder):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        if len(Path(dirpath).parts) - base >= 3:
+            dirnames[:] = []
+        for f in files:
+            if f.startswith("."):
+                continue
+            p = Path(dirpath) / f
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            real = _strip_partial(p)
+            kind = kinds.classify(real, None)
+            title = re.sub(r"[_]+", " ", real.stem).strip() or real.name
+            items.append(Item(path=p, kind=kind, category=category, root=root, title=title,
+                              size=st.st_size, mtime=st.st_mtime, busy=_is_busy(p, st)))
+    return items
+
+
+def scan_category(cat: Category) -> list[Item]:
+    out: list[Item] = []
+    for folder in cat.folders:
+        root = folder.parent
+        if cat.kind == "games":
+            out.extend(_scan_games_like(folder, cat.name, root))
+        elif cat.kind in ("movies", "tv", "music"):
+            out.extend(_scan_media(folder, cat.name, root))
+        else:
+            out.extend(_scan_any(folder, cat.name, root))
+    return out

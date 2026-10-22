@@ -24,6 +24,8 @@ DEFAULTS = {
     "last_good": {},
     # Default destination per category when filing (category -> folder).
     "file_to": {},
+    # Unfinished downloads, resumed when Bramble opens: [{link, folder}].
+    "downloads": [],
 }
 
 

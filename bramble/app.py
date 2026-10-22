@@ -1,8 +1,7 @@
-"""Starting Bramble: one window per person, themed like Slate.
+"""Starting Bramble: one window per person.
 
     python -m bramble              open the window
     python -m bramble --selftest   build the window off-screen, scan, exit 0 if all is well
-    python -m bramble FILE...      open the window and offer to file these
 """
 from __future__ import annotations
 
@@ -10,7 +9,6 @@ import getpass
 import logging
 import os
 import sys
-from pathlib import Path
 
 from . import __version__, paths
 
@@ -23,18 +21,39 @@ def _log_setup() -> None:
                         datefmt="%Y-%m-%d %H:%M:%S")
 
 
+def _qt_app(argv):
+    from PyQt6.QtGui import QIcon
+    from PyQt6.QtWidgets import QApplication
+    # (Qt already follows the screen's Xft.dpi on Linux, so a 4K laptop gets 2x by itself.)
+    if paths.IS_LINUX:
+        # Hawthorn's window class, so the compositor gives Bramble the same
+        # treatment: no forced opacity, rounding, shadow or blur (picom.conf).
+        os.environ.setdefault("RESOURCE_NAME", "pale-lab-backdrop")
+    app = QApplication(argv)
+    app.setApplicationName("pale-lab-backdrop" if paths.IS_LINUX else "Bramble")
+    app.setApplicationDisplayName("bramble")
+    from .ui import paint
+    paint.load_fonts()
+    icon = paths.PACKAGE_DIR / "ui" / "bramble.svg"
+    if icon.exists():
+        app.setWindowIcon(QIcon(str(icon)))
+    return app
+
+
 def selftest() -> int:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PyQt6.QtWidgets import QApplication
     from . import library, tools
     from .settings import Settings
-    from .ui.main_window import MainWindow
-    app = QApplication(sys.argv)
+    from .ui.window import BrambleWindow
+    app = _qt_app(sys.argv)
     s = Settings()
-    w = MainWindow(s)
-    items = library.scan(s)
+    w = BrambleWindow(s)
+    w.show()
+    app.processEvents()
+    cats = library.categories(s)
+    n = sum(len(library.scan_category(c)) for c in cats)
     found = {t: bool(tools.find_all(t)) for t in tools.TOOLS}
-    print(f"bramble {__version__} selftest: window ok, {len(items)} library items, "
+    print(f"bramble {__version__} selftest: window ok, {len(cats)} categories, {n} items, "
           f"programs: {', '.join(k for k, v in found.items() if v) or 'none'}")
     w.close()
     app.quit()
@@ -49,18 +68,8 @@ def main() -> int:
     if "--selftest" in args:
         return selftest()
     _log_setup()
-    from PyQt6.QtCore import QTimer
-    from PyQt6.QtGui import QFont, QIcon
     from PyQt6.QtNetwork import QLocalServer, QLocalSocket
-    from PyQt6.QtWidgets import QApplication
-
-    app = QApplication(sys.argv)
-    app.setApplicationName("Bramble")
-    app.setDesktopFileName("bramble")
-    app.setFont(QFont("Inter", 10))
-    icon = paths.PACKAGE_DIR / "ui" / "bramble.svg"
-    if icon.exists():
-        app.setWindowIcon(QIcon(str(icon)))
+    app = _qt_app(sys.argv)
 
     # One Bramble per person: a second launch brings the first one forward.
     key = f"bramble-{getpass.getuser()}"
@@ -76,8 +85,8 @@ def main() -> int:
     server.listen(key)
 
     from .settings import Settings
-    from .ui.main_window import MainWindow
-    win = MainWindow(Settings())
+    from .ui.window import BrambleWindow
+    win = BrambleWindow(Settings())
 
     def raise_window():
         conn = server.nextPendingConnection()
@@ -87,19 +96,6 @@ def main() -> int:
         win.raise_()
         win.activateWindow()
     server.newConnection.connect(raise_window)
-
     win.show()
-    files = [Path(a) for a in args if not a.startswith("-") and Path(a).exists()]
-    if files:
-        def offer():
-            from PyQt6.QtCore import QMimeData, QUrl
-            for f in files:
-                from . import kinds, library
-                it = (library._folder_game(f, "Video Games", f.parent) if f.is_dir()
-                      else library._file_item(f, None, f.parent))
-                if it:
-                    it.category = kinds.CATEGORY_FOR_KIND.get(it.kind, "Other")
-                    win.file_item(it)
-        QTimer.singleShot(400, offer)
     logging.info("bramble %s started from %s", __version__, paths.APP_DIR)
     return app.exec()

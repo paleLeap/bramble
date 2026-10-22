@@ -24,7 +24,8 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 APP_DIR = PACKAGE_DIR.parent
 
 # The library's folders, in the order the window lists them.
-CATEGORIES = ["Movies", "TV Shows", "Video Games", "Music", "Programs", "Other"]
+# The four the list always starts with; any other folder in MARROW is a category too.
+CATEGORIES = ["Movies", "TV Shows", "Video Games", "Music"]
 MARROW_NAME = "MARROW"
 
 
