@@ -88,7 +88,6 @@ class BrambleWindow(QWidget):
         self.shown_row: Row | None = None      # the row the card belongs to (kept while closing)
         self.timeline = anim.Timeline(look.CARD_TEXT[1])
         self.panel: Panel | None = None
-        self.card_h = anim.Prop(0.0, look.MOVE_MS)     # the card follows its contents' height
         self.returning = False                         # closing: the lines wait for the card
         self.brand_a = anim.Prop(look.TEXT_SOFT, look.BRAND_MS, look.css_ease)
         self.close_hover = anim.Prop(0.0, look.COLOR_MS, look.css_ease)
@@ -188,7 +187,6 @@ class BrambleWindow(QWidget):
         self.open_row = row
         self.shown_row = row
         self.panel = Panel(self, row.cat)
-        self.card_h.jump(look.ROW * 2 + 2 * look.CARD_PAD)
         self.timeline.open()
         self._settle()
         self.refresh_panel()
@@ -223,6 +221,7 @@ class BrambleWindow(QWidget):
             jobs += [j for j in self.copies if j.folder in ([c.home] + c.folders)
                      and not (j.finished and not j.failed)]
             panel.set_items(items, jobs)
+            panel.preload()
         self.run(work, done)
 
     # --- the text box (a new category, or a link to add) ------------------------------
@@ -419,18 +418,15 @@ class BrambleWindow(QWidget):
         return look.MENU_TOP + i * look.ROW
 
     def _card_geometry(self) -> QRectF | None:
-        """The card: centred across the window, under the chosen line, as tall as what it
-        holds (up to the window's bottom margin)."""
+        """The card: centred across the window under the chosen line, a fixed height
+        (it never resizes while open; only the hovered title grows inside it)."""
         row = self.shown_row
         if row is None or row not in self.rows:
             return None
-        i = self.rows.index(row)
-        top = self._row_y(i) + look.ROW + 12
+        top = self._row_y(self.rows.index(row)) + look.ROW + 12
         w, h = self.width(), self.height()
-        most = h - top - look.CARD_MARGIN
-        want = self.panel.natural_height() if self.panel else look.ROW * 2
-        self.card_h.set(max(look.ROW * 2 + 2 * look.CARD_PAD, min(most, want)))
-        return QRectF(look.CARD_MARGIN, top, w - 2 * look.CARD_MARGIN, min(most, self.card_h.value))
+        height = max(look.ROW * 2 + 2 * look.CARD_PAD, h - top - look.CARD_BOTTOM)
+        return QRectF(look.CARD_MARGIN, top, w - 2 * look.CARD_MARGIN, height)
 
     # --- frame ----------------------------------------------------------------------
     def _tick(self) -> None:
@@ -442,8 +438,7 @@ class BrambleWindow(QWidget):
             self.panel = None
             self.shown_row = None
         self.update()
-        busy = (self.timeline.moving or any(r.moving() for r in self.rows) or self.card_h.moving
-                or self.brand_a.moving or self.close_hover.moving or self.returning
+        busy = (self.timeline.moving or any(r.moving() for r in self.rows) or self.brand_a.moving or self.close_hover.moving or self.returning
                 or (self.panel and self.panel.moving()))
         self.timer.setInterval(16 if busy else 33)
 

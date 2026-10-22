@@ -24,6 +24,8 @@ from . import anim, look, paint
 ROW = look.ROW
 LINE_H = 16          # one line of info text
 THUMB_W = 128
+THUMB_H = 72         # every thumbnail sits in the same 16:9 box, so every title grows the same
+INFO_H = 2 + THUMB_H + 6 + LINE_H + 8
 
 
 def duration(secs: float) -> str:
@@ -41,7 +43,7 @@ class Entry:
     depth: int = 0
     download: object | None = None                           # downloads.Job or CopyJob
     hover: anim.Prop = field(default_factory=lambda: anim.Prop(0.0, look.COLOR_MS, look.css_ease))
-    grow: anim.Prop = field(default_factory=lambda: anim.Prop(0.0, look.MOVE_MS))   # px of info shown
+    grow: anim.Prop = field(default_factory=lambda: anim.Prop(0.0, look.GROW_MS))   # px of info shown
     turn: anim.Prop = field(default_factory=lambda: anim.Prop(0.0, look.MOVE_MS))   # + -> -
 
     @property
@@ -159,9 +161,42 @@ class Panel:
             else:
                 self.open_groups.add(e.key)
                 e.turn.set(1.0)
+                self.preload()
             return
         if e.item is not None:
             self.host.play(e.item, self)
+
+    def preload(self) -> None:
+        """Look inside everything listed, one at a time in the background, so a title
+        is ready to open the moment the pointer reaches it."""
+        todo = [e.item for e in self._walk(self.entries)
+                if e.item is not None and not self.infos.get(e.key, Info()).loaded
+                and not self.infos.get(e.key, Info()).busy]
+        if not todo:
+            return
+        for it in todo:
+            self.infos.setdefault(it.key, Info()).busy = True
+
+        def work():
+            for it in todo:
+                info = self.infos[it.key]
+                try:
+                    pr, thumb, issues = self._gather(it)
+                    info.pr, info.line, info.issues = pr, info_line(it, pr), issues
+                    info.thumb = QImage(str(thumb)) if thumb else None
+                except Exception:
+                    pass
+                info.busy, info.loaded = False, True
+        self.host.run(work)
+
+    @staticmethod
+    def _gather(item: Item):
+        from .. import thumbs
+        pr = probe.probe(item.path) if item.kind in ("movie", "episode", "music") else None
+        thumb = thumbs.thumbnail(item, pr)
+        issues = [i for i in checks.before_open(item, pr)
+                  if i.level in ("warn", "bad") or any(f.run for f in i.fixes)]
+        return pr, thumb, issues
 
     def _load_info(self, item: Item) -> None:
         info = self.infos.setdefault(item.key, Info())
@@ -170,12 +205,7 @@ class Panel:
         info.busy = True
 
         def work():
-            from .. import thumbs
-            pr = probe.probe(item.path) if item.kind in ("movie", "episode", "music") else None
-            thumb = thumbs.thumbnail(item, pr)
-            issues = [i for i in checks.before_open(item, pr)
-                      if i.level in ("warn", "bad") or any(f.run for f in i.fixes)]
-            return pr, thumb, issues
+            return self._gather(item)
 
         def done(res, err):
             info.busy = False
@@ -286,29 +316,27 @@ class Panel:
         return k == "entry:" + e.key or k.startswith(f"fix:{e.key}:")
 
     def _info_height(self, e: Entry, width: float) -> float:
+        """The same for every title of a kind, known before anything has loaded, so the
+        one closing and the one opening trade height evenly and the list holds still."""
         if e.download is not None:
             if e.download.failed:
                 return self._error_h([e.download.error], width,
                                      bool(getattr(e.download, "needs", ""))) + 4
             return 0.0
-        info = self.infos.get(e.key)
-        if info is None or (not info.loaded and not info.busy):
+        if e.item is None:
             return 0.0
-        h = 2.0
-        if info.thumb is not None and not info.thumb.isNull():
-            tw = min(THUMB_W, width * 0.6)
-            h += tw * info.thumb.height() / max(1, info.thumb.width()) + 6
-        if info.line:
-            h += LINE_H
-        if info.busy:
-            h += 10
-        for iss in info.issues:
-            h += self._error_h([iss.title], width, any(not f.guide for f in iss.fixes))
-        if info.error:
-            h += self._error_h(info.error, width, bool(info.error_fixes))
-            if info.hint:
-                h += 17 * len(self._wrap(info.hint, 12, width)) + 4
-        return h + 8
+        info = self.infos.get(e.key)
+        has_thumb = e.item.kind in ("movie", "episode") or (
+            info is not None and info.thumb is not None and not info.thumb.isNull())
+        h = INFO_H if has_thumb else 2 + LINE_H + 8
+        if info is not None:
+            for iss in info.issues:
+                h += self._error_h([iss.title], width, any(not f.guide for f in iss.fixes))
+            if info.error:
+                h += self._error_h(info.error, width, bool(info.error_fixes))
+                if info.hint:
+                    h += 17 * len(self._wrap(info.hint, 12, width)) + 4
+        return h
 
     def _paint_info(self, p, e: Entry, x, y, width) -> None:
         if e.download is not None:
@@ -321,20 +349,23 @@ class Panel:
         if info is None:
             return
         y += 2
-        if info.thumb is not None and not info.thumb.isNull():
-            tw = min(THUMB_W, width * 0.6)
-            th = tw * info.thumb.height() / max(1, info.thumb.width())
-            r = QRectF(x, y, tw, th)
-            p.drawImage(r, info.thumb)
+        box_on = e.item is not None and (e.item.kind in ("movie", "episode") or (
+            info.thumb is not None and not info.thumb.isNull()))
+        if box_on:
+            box = QRectF(x, y, THUMB_W, THUMB_H)
+            if info.thumb is not None and not info.thumb.isNull():
+                iw, ih = info.thumb.width(), info.thumb.height()
+                k = min(THUMB_W / iw, THUMB_H / ih)
+                r = QRectF(x, y + (THUMB_H - ih * k) / 2, iw * k, ih * k)
+                p.drawImage(r, info.thumb)
+            elif info.busy:
+                self._busy(p, x, y + THUMB_H / 2)
             # the thumbnail opens it too
-            self.regions.append((r, "entry:" + e.key, lambda e=e: self.click_entry(e)))
-            y += th + 6
+            self.regions.append((box, "entry:" + e.key, lambda e=e: self.click_entry(e)))
+            y += THUMB_H + 6
         if info.line:
             paint.draw_text(p, x, y, info.line, look.NOTE_PX, look.FAINT)
-            y += LINE_H
-        if info.busy:
-            self._busy(p, x, y + 4)
-            y += 10
+        y += LINE_H
         for iss in info.issues:
             fixes = [f for f in iss.fixes if not f.guide]
             y = self._error_box(p, e, x, y, width, [iss.title], fixes, e.item)
