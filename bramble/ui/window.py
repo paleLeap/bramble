@@ -433,6 +433,11 @@ class BrambleWindow(QWidget):
         query = self.search.text().strip()
         if not query:
             return
+        from ..sources import plugins
+        if plugins.is_plugin_ref(query):
+            self.search.clear()
+            self.add_plugin(query)
+            return
         self.hide_entry()
         if self.panel:
             self.panel.cancel_adding()
@@ -450,6 +455,18 @@ class BrambleWindow(QWidget):
             wing.set_results(res.results, note)
         self.run(lambda: sources.search(query, names), done)
 
+    def add_plugin(self, ref: str) -> None:
+        """A search plugin's address (or file) given to Bramble: keep it for searching."""
+        from ..sources import plugins
+        self._say("adding to search…", secs=30)
+
+        def done(name, err):
+            if err:
+                self._say(f"could not add it: {err}", secs=12)
+            else:
+                self._say(f"added {name} to search", secs=8)
+        self.run(lambda: plugins.install(ref), done)
+
     def choose_result(self, r, row_y: float) -> None:
         """A torrent clicked in the results window: download it into the holding folder
         and show its download window below."""
@@ -466,7 +483,15 @@ class BrambleWindow(QWidget):
 
         def done(link, err):
             if err or not link:
-                link = r.link
+                # the site's plugin could not produce a torrent: say so, download nothing
+                job = downloads.Job(r.link, marrow, title, finished=True, failed=True,
+                                    error="The site's plugin could not find a download link for "
+                                          "this one. The plugin may be out of date.")
+                job.source_link = r.link
+                self.downloads.jobs.append(job)
+                if self.wing.chosen is r:
+                    self.wing.job = job
+                return
             import uuid
             holding = marrow / ".holding" / uuid.uuid4().hex[:10]
             holding.mkdir(parents=True, exist_ok=True)
@@ -701,10 +726,14 @@ class BrambleWindow(QWidget):
             return
         h = self.height()
         width = self.width() - 14 - 130 - 14 - 14
-        text = paint.elide(self.notice, look.NOTE_PX, width)
+        # wraps upward (up to four lines) rather than cutting a reason off
+        from .wing import _wrap
+        lines = _wrap(self.notice, look.NOTE_PX, width)[:4]
         hv = 1.0 if self.hover_key == "notice" else 0.0
         col = look.alpha(look.mix(look.DIM, look.TEXT, hv), a)
-        tw = paint.draw_text(p, 14, h - 14 - 16, text, look.NOTE_PX, col)
+        tw = 0.0
+        for i, line in enumerate(reversed(lines)):
+            tw = max(tw, paint.draw_text(p, 14, h - 14 - 16 - 15 * i, line, look.NOTE_PX, col))
         if self.notice_target is not None:
             target = self.notice_target
             self.regions.append((QRectF(14, h - 34, tw + 4, 20), "notice",
@@ -850,13 +879,24 @@ class BrambleWindow(QWidget):
                 self.close()
 
     def dragEnterEvent(self, ev) -> None:
-        if ev.mimeData().hasUrls() and self.open_row is not None:
+        from ..sources import plugins
+        urls = ev.mimeData().urls() if ev.mimeData().hasUrls() else []
+        if urls and (self.open_row is not None or all(
+                plugins.is_plugin_ref(u.toLocalFile() or u.toString()) for u in urls)):
             ev.acceptProposedAction()
 
     def dropEvent(self, ev) -> None:
-        if not self.panel:
-            return
+        from ..sources import plugins
+        rest = []
         for url in ev.mimeData().urls():
+            ref = url.toLocalFile() or url.toString()
+            if plugins.is_plugin_ref(ref):
+                self.add_plugin(ref)        # a search plugin, wherever it is dropped
+            else:
+                rest.append(url)
+        if not rest or not self.panel:
+            return
+        for url in rest:
             if url.isLocalFile():
                 self.add_file(self.panel.category, Path(url.toLocalFile()))
             else:

@@ -12,8 +12,10 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import re
 import sys
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
 from .. import paths
@@ -93,12 +95,18 @@ class Plugin:
             return link
         fn = getattr(self.engine, "download_torrent", None)
         if fn is None:
-            return link
+            return ""                     # a page, and no way to turn it into a torrent
         buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            fn(link)
+        try:
+            with contextlib.redirect_stdout(buf):
+                fn(link)
+        except Exception:
+            return ""
         said = buf.getvalue().strip().split()
-        return said[0] if said else link
+        got = said[0] if said else ""
+        if got.startswith("magnet:") or got.lower().endswith(".torrent") or Path(got).is_file():
+            return got
+        return ""                         # it answered with nothing usable
 
 
 def load_all() -> tuple[list[Plugin], list[str]]:
@@ -109,3 +117,71 @@ def load_all() -> tuple[list[Plugin], list[str]]:
         except Exception as e:
             errors.append(f"{p.stem}: could not load ({e})")
     return plugins, errors
+
+
+# --- adding plugins from inside Bramble -------------------------------------------
+
+def is_plugin_ref(text: str) -> bool:
+    """A plugin file's address or path, as typed into the search box or dropped."""
+    t = text.strip().strip('"').strip("'")
+    return t.lower().split("?")[0].endswith(".py")
+
+
+def _raw(url: str) -> str:
+    # a GitHub page for a file -> the file itself
+    m = re.match(r"https?://github\.com/([^/]+)/([^/]+)/blob/(.+)", url)
+    if m:
+        return f"https://raw.githubusercontent.com/{m.group(1)}/{m.group(2)}/{m.group(3)}"
+    return url
+
+
+def install_folder() -> Path:
+    """Where a new plugin goes: the drive Bramble runs from (so it travels), else this PC."""
+    for d in paths.find_drives():
+        f = d / "INNARDS" / "bramble" / "plugins"
+        try:
+            f.mkdir(parents=True, exist_ok=True)
+            probe = f / ".bramble-write-test"
+            probe.write_text("x")
+            probe.unlink()
+            return f
+        except OSError:
+            continue
+    f = paths.config_dir() / "plugins"
+    f.mkdir(parents=True, exist_ok=True)
+    return f
+
+
+def install(ref: str) -> str:
+    """Fetch or copy a qBittorrent search plugin into the plugins folder. Returns the
+    name it searches as. Raises ValueError with a plain reason if it is not one."""
+    ref = ref.strip().strip('"').strip("'")
+    if re.match(r"(?i)https?://", ref):
+        url = _raw(ref)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 Bramble/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            code = r.read().decode("utf-8", "replace")
+        filename = Path(urllib.parse.urlparse(url).path).name
+    else:
+        src = Path(ref).expanduser()
+        if not src.is_file():
+            raise ValueError(f"{src.name} was not found.")
+        code = src.read_text(encoding="utf-8", errors="replace")
+        filename = src.name
+    stem = Path(filename).stem
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", stem):
+        raise ValueError(f"{filename} does not have a plugin's name (letters, digits and _ only).")
+    try:
+        compile(code, filename, "exec")
+    except SyntaxError as e:
+        raise ValueError(f"{filename} is not a working Python file ({e.msg}, line {e.lineno}).")
+    if not re.search(rf"^class\s+{re.escape(stem)}\b", code, re.M) or "def search" not in code:
+        raise ValueError(f"{filename} is not a qBittorrent search plugin "
+                         f"(it needs a class called {stem} with a search).")
+    target = install_folder() / filename
+    target.write_text(code, encoding="utf-8")
+    try:
+        return Plugin(target).name
+    except Exception as e:
+        target.unlink(missing_ok=True)
+        raise ValueError(f"{filename} could not start: {e}")
