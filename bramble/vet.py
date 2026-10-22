@@ -56,7 +56,7 @@ def main_kind(files: list[Path]) -> str:
     for p in sorted(files, key=lambda p: -p.stat().st_size):
         k = kinds.classify(p, None)
         if k in ("movie", "episode", "music", "rom", "game_windows", "game_linux",
-                 "program", "installer"):
+                 "program", "installer", "document"):
             return k
         if p.suffix.lower() in (".iso", ".bin", ".chd", ".cue") and p.stat().st_size > 50 << 20:
             return "game_windows"
@@ -98,7 +98,7 @@ def check(root: Path) -> Verdict:
     if not files:
         return Verdict(False, "other", reasons=["The download is empty."])
     kind = main_kind(files)
-    media = kind in ("movie", "episode", "music")
+    media = kind in ("movie", "episode", "music", "document")     # nothing in these should run
     v = Verdict(True, kind)
 
     for p in files:
@@ -114,7 +114,10 @@ def check(root: Path) -> Verdict:
         elif media and ext in ARCHIVES and p.stat().st_size < 50 << 20:
             v.reasons.append(f"{p.name} is a packed file a film never needs (a common trick).")
 
-    if media:
+    if media and kind == "document":
+        v.keep = [p for p in files if p.suffix.lower() in (kinds.DOCUMENT | kinds.AUDIO)
+                  or (p.suffix.lower() in kinds.IMAGE and p.stat().st_size > (4 << 20))]
+    elif media:
         main = max((p for p in files if p.suffix.lower() in (kinds.VIDEO | kinds.AUDIO)),
                    key=lambda p: p.stat().st_size, default=None)
         if main is None:
@@ -138,7 +141,8 @@ def check(root: Path) -> Verdict:
     v.scanned = scanner
     if clean is False:
         v.reasons.append(f"The virus scan ({scanner}) found a threat. {detail}".strip())
-    elif clean is None and not media and not v.reasons:
+    elif clean is None and not media and not v.reasons and any(
+            p.suffix.lower() in RUNNABLE for p in files):
         v.needs_choice = True
         v.reasons.append("This contains programs and this PC has no virus scanner to check them.")
 
@@ -157,10 +161,7 @@ def file_into_library(root: Path, v: Verdict, marrow: Path, into: Path | None = 
     """Move what passed into the right category folder (or `into`, when it was added to
     a particular category); returns where it went. Films keep their own folder (as
     torrents make them) unless they are a single file."""
-    category = kinds.CATEGORY_FOR_KIND.get(v.kind, "Other")
-    if category in ("Programs", "Other"):
-        category = "Other"
-    dest_root = into if into is not None else marrow / category
+    dest_root = into if into is not None else category_folder(marrow, v.kind)
     if into is None and v.kind in ("episode", "rom", "game_windows", "game_linux"):
         main = max(v.keep, key=lambda p: p.stat().st_size)
         for part in kinds.suggested_subfolder(Path(main.name), v.kind if v.kind != "game_windows" else "x"):
@@ -178,6 +179,19 @@ def file_into_library(root: Path, v: Verdict, marrow: Path, into: Path | None = 
     target = _free(dest_root / src.name)
     shutil.move(str(src), str(target))
     return target
+
+
+def category_folder(marrow: Path, kind: str) -> Path:
+    """The person's category for this kind of thing (by its name: "movies", "Films" ...),
+    or a new one named for it when they have none."""
+    group = kinds.GROUP_OF_KIND.get(kind, "other")
+    try:
+        for d in sorted(marrow.iterdir()):
+            if d.is_dir() and not d.name.startswith(".") and kinds.group_of_name(d.name) == group:
+                return d
+    except OSError:
+        pass
+    return marrow / kinds.DEFAULT_NAME[group]
 
 
 def _free(target: Path) -> Path:

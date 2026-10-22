@@ -24,8 +24,9 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 APP_DIR = PACKAGE_DIR.parent
 
 # The library's folders, in the order the window lists them.
-# The four the list always starts with; any other folder in MARROW is a category too.
-CATEGORIES = ["Movies", "TV Shows", "Video Games", "Music"]
+# None built in (user, 2026-10-22): a fresh Bramble shows only its name and "+". Every
+# folder in MARROW is a category, named whatever the person called it.
+CATEGORIES: list[str] = []
 MARROW_NAME = "MARROW"
 
 

@@ -30,6 +30,10 @@ DEFAULTS = {
     "sources": [],
     # Plugins switched off with the leaf beside the search box (by file name).
     "sources_off": [],
+    # Categories in the order the person made them (folder names, any case).
+    "category_order": [],
+    # The torrent program tried first: "qbittorrent" or "aria2" (the other is the fallback).
+    "torrent_program": "qbittorrent",
 }
 
 

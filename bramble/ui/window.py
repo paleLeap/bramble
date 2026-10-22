@@ -293,9 +293,10 @@ class BrambleWindow(QWidget):
         if what == "category":
             name = "".join(ch for ch in text if ch not in '/\\:*?"<>|').strip()
             if name:
-                home = library.categories(self.settings)[0].home.parent
+                home = self._marrow()
                 try:
                     (home / name).mkdir(parents=True, exist_ok=True)
+                    self.settings["category_order"] = list(self.settings["category_order"]) + [name]
                 except OSError:
                     pass
                 self.set_categories(library.categories(self.settings))
@@ -582,14 +583,16 @@ class BrambleWindow(QWidget):
         # no page to open (the source gives the link itself): offer that link instead
         self.wing.open_paste(r, row_y, prefill="" if page else r.link)
 
-    def start_link(self, link: str, title: str = "", into: Path | None = None, source_link: str = ""):
+    def start_link(self, link: str, title: str = "", into: Path | None = None, source_link: str = "",
+                   program: str = ""):
         """Every link Bramble downloads goes through here: into a holding folder, then the
         checks (vet.py), then into the library (or `into`)."""
         import uuid
         marrow = self._marrow()
         holding = marrow / ".holding" / uuid.uuid4().hex[:10]
         title = kinds._tidy(title) if title else downloads.title_of(link)
-        job = self.downloads.start(link.strip(), holding, marrow=marrow, title=title, into=into)
+        job = self.downloads.start(link.strip(), holding, marrow=marrow, title=title, into=into,
+                                   program=program)
         job.source_link = source_link
         self._say(f"{title} is downloading")
         return job
@@ -773,16 +776,24 @@ class BrambleWindow(QWidget):
             hv, on = r.hover.value, r.open.value
             cy = y + look.ROW / 2
             if r.cat is None:
-                # the "+" for a new category: invisible until hovered, centred under the
-                # first letter of the name above it
-                above = self.rows[i - 1].label if i else ""
-                cx = self.x0 + look.MARKER_W + paint.first_letter_centre(
-                    above, look.MENU_PX, look.MENU_WEIGHT, look.MENU_TRACK) + r.x.value
+                # the "+" for a new category. With none yet it is the only thing there, so it
+                # shows (where a category's "+" will sit); after that it is invisible until
+                # hovered, centred under the first letter of the name above it.
+                if i == 0:
+                    cx = self.x0 + plus_w / 2 + r.x.value
+                    shown = max(1.0, hv)
+                    colr = look.mix(look.FAINT, look.DIM, hv)
+                else:
+                    above = self.rows[i - 1].label
+                    cx = self.x0 + look.MARKER_W + paint.first_letter_centre(
+                        above, look.MENU_PX, look.MENU_WEIGHT, look.MENU_TRACK) + r.x.value
+                    shown = hv
+                    colr = look.DIM
                 if self.entry_for != "category":
-                    if hv > 0.01:
+                    if shown > 0.01:
                         p.save()
                         p.setOpacity(op)
-                        paint.draw_marker(p, cx, cy, look.MENU_PX, 0.0, look.alpha(look.DIM, hv))
+                        paint.draw_marker(p, cx, cy, look.MENU_PX, 0.0, look.alpha(colr, shown))
                         p.restore()
                     if op > 0.5:
                         self.regions.append((QRectF(cx - 11, y, 22, look.ROW), f"row:{i}",

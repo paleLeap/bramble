@@ -119,10 +119,11 @@ class Downloads:
             for j in self.jobs if not j.finished]
 
     def start(self, link: str, folder: Path, remember: bool = True, marrow: Path | None = None,
-              title: str = "", into: Path | None = None) -> Job:
+              title: str = "", into: Path | None = None, program: str = "") -> Job:
         """Download into `folder`. With `marrow`, `folder` is a holding folder: when the
         download finishes it is checked (vet.py) and filed into that library (or `into`)."""
         job = Job(link.strip(), folder, title or title_of(link), marrow=marrow, into=into)
+        job.program = program or self.settings["torrent_program"]
         self.jobs.append(job)
         if remember:
             self._remember()
@@ -131,9 +132,16 @@ class Downloads:
         return job
 
     def _run(self, job: Job) -> None:
-        """qBittorrent first; aria2 if it cannot start, will not take the link, or fails."""
+        """The chosen program first; the other if it cannot start, refuses the link, or fails."""
         from . import qbit
         why = ""
+        if getattr(job, "program", "qbittorrent") == "aria2" and self.aria2():
+            self._start_aria2(job)
+            if not job.failed:
+                return
+            why = f"aria2: {job.error}"
+            job.failed = job.finished = False
+            job.error, job.percent = "", -1
         try:
             q = qbit.get()
             job.engine = "qBittorrent"
@@ -142,9 +150,14 @@ class Downloads:
             why = job.error
         except OSError as e:
             why = str(e)
-        job.failed = job.finished = False
-        job.error, job.percent, job.engine = "", -1, ""
-        self._start_aria2(job, why)
+        if job.engine == "qBittorrent" or getattr(job, "program", "") != "aria2":
+            job.failed = job.finished = False
+            job.error, job.percent, job.engine = "", -1, ""
+            self._start_aria2(job, why)
+        else:
+            job.failed = job.finished = True
+            job.error = f"Neither torrent program could run. {why}"
+            self.on_change(job)
 
     def _follow_qbit(self, job: Job, q) -> bool:
         """Add the torrent and watch it to the end. False if qBittorrent gave up on it."""

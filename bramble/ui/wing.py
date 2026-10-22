@@ -29,11 +29,11 @@ from PyQt6.QtWidgets import QWidget
 from .. import kinds, sources
 from . import anim, look, paint
 
-WING_W = 270             # how far the side windows reach right of Bramble
+WING_W = 300             # how far the side windows reach right of Bramble
 WING_EXTRA = 70          # and below it (the download window hangs a little lower)
 GAP = 20                 # Hawthorn's CON_GAP
 RES_W = 180              # Hawthorn's console is 170 wide; a little more for names
-DL_W = 196
+DL_W = 232
 DL_SHIFT = 37            # the download window sits this far right of the results window
 TIMELINE = (0.00, 0.28), (0.28, 0.52), (0.52, 1.00), (0.90, 1.12)   # across, turn, card, text
 LINE_START = 6
@@ -84,7 +84,7 @@ class Wing(QWidget):
         self.paste = QLineEdit(self)
         self.paste.hide()
         self.paste.setFrame(False)
-        self.paste.setPlaceholderText("paste magnet link")
+        self.paste.setPlaceholderText("Magnet Link.")
         self.paste.setStyleSheet(
             f"QLineEdit {{ background: transparent; color: {look.TEXT.name()}; border: none;"
             f" border-bottom: 1px solid {look.FAINT.name()}; padding: 0px; }}")
@@ -93,6 +93,8 @@ class Wing(QWidget):
         self.paste.setPalette(pal)
         self.paste.setFont(paint.font(look.NOTE_PX + 1))
         self.paste.returnPressed.connect(self._pasted)
+        self.paste.textChanged.connect(lambda _t: self.update())
+        self.choosing = False            # the list of torrent programs is open
 
     # --- where it sits ------------------------------------------------------------
     def follow(self) -> None:
@@ -145,6 +147,7 @@ class Wing(QWidget):
         """The download window, asking for the link the person copies from the site's page."""
         self.chosen, self.chosen_row_y, self.job = result, row_y, None
         self.pasting = True
+        self.choosing = False
         self.paste.setText(prefill)
         self.dl_card.tl.open()
 
@@ -159,19 +162,26 @@ class Wing(QWidget):
             self.main.raise_()
             self.raise_()
 
-    def _pasted(self) -> None:
-        link = self.paste.text().strip()
-        if not link:
-            return
+    def _link_ok(self) -> bool:
         from .. import downloads
-        if not downloads.looks_like_link(link) and not link.startswith("magnet:"):
-            self.paste.clear()
-            self.paste.setPlaceholderText("that is not a magnet or torrent link")
+        link = self.paste.text().strip()
+        return bool(link) and (link.startswith("magnet:?") or downloads.looks_like_link(link))
+
+    def _pasted(self) -> None:
+        if not self._link_ok():
             return
+        link = self.paste.text().strip()
         self.pasting = False
+        self.choosing = False
         self.paste.hide()
         r = self.chosen
-        self.job = self.main.start_link(link, title=r.title if r else "", source_link=r.link if r else "")
+        self.job = self.main.start_link(link, title=r.title if r else "",
+                                        source_link=r.link if r else "",
+                                        program=self.main.settings["torrent_program"])
+
+    def _choose(self, program: str) -> None:
+        self.main.settings["torrent_program"] = program
+        self.choosing = False
 
     def close_download(self) -> None:
         self.pasting = False
@@ -349,10 +359,38 @@ class Wing(QWidget):
                     self.paste.setFocus()
             elif self.paste.isVisible():
                 self.paste.hide()
-            self.dl_h.set(84)
+            y += 30
+            if self._link_ok():
+                # it grows a little: which program will download it, and a way to change that
+                names = {"qbittorrent": "qBittorrent", "aria2": "aria2"}
+                prog = self.main.settings["torrent_program"]
+                q = f"Download with {names.get(prog, prog)}?"
+                hv = 1.0 if self.hover_key == "go" else 0.0
+                w = paint.draw_text(p, x, y, q, look.LIST_PX, look.mix(look.DIM, look.TEXT, hv), glow=hv)
+                if live:
+                    self.regions.append((QRectF(x - 2, y - 2, w + 6, 20), "go", self._pasted))
+                hv2 = 1.0 if self.hover_key == "change" else 0.0
+                cw = paint.draw_text(p, x + w + 10, y + 2, "Change.", look.NOTE_PX,
+                                     look.mix(look.FAINT, look.TEXT, hv2))
+                if live:
+                    self.regions.append((QRectF(x + w + 8, y, cw + 6, 18), "change",
+                                         lambda: setattr(self, "choosing", not self.choosing)))
+                y += 24
+                if self.choosing:
+                    for key, label in (("qbittorrent", "qBittorrent"), ("aria2", "aria2")):
+                        on = key == prog
+                        hk = "prog:" + key
+                        hv3 = 1.0 if self.hover_key == hk else 0.0
+                        paint.draw_text(p, x + 12, y, label, look.NOTE_PX + 1,
+                                        look.mix(look.TEXT if on else look.FAINT, look.TEXT, hv3))
+                        self._ring(p, x + width - 8, y + 8, on)
+                        if live:
+                            self.regions.append((QRectF(x + 4, y - 2, width, 20), hk,
+                                                 lambda k=key: self._choose(k)))
+                        y += 20
+            self.dl_h.set(max(70.0, y - full.top() + 8))
             return
         if job is None:
-            self._busy(p, x, y + 6)
             self.dl_h.set(84)
             return
         stage = getattr(job, "stage", "")
@@ -373,12 +411,11 @@ class Wing(QWidget):
         y += 20
         # progress: the share done as a brighter stretch of a faint line (busy bar when unknown)
         if not job.finished or stage == "checking":
-            if job.percent > 0 and stage != "checking":
-                p.fillRect(QRectF(x, y, width, 2), look.alpha(look.FAINT, 0.45))
-                p.fillRect(QRectF(x, y, width * job.percent / 100, 2),
-                           QColor(0xe8, 0xea, 0xee, int(0.85 * 255)))
-            else:
-                self._busy(p, x, y)
+            # the real share done, from the torrent program (full while it is being checked)
+            done = 100 if stage == "checking" else max(0, job.percent)
+            p.fillRect(QRectF(x, y, width, 2), look.alpha(look.FAINT, 0.45))
+            if done:
+                p.fillRect(QRectF(x, y, width * done / 100, 2), QColor(0xe8, 0xea, 0xee, int(0.85 * 255)))
             y += 12
         if stage == "ready" and job.landed:
             key = "open"
@@ -413,6 +450,21 @@ class Wing(QWidget):
                 lx += w + 14
             y += 18
         self.dl_h.set(max(84.0, y - full.top() + 10))
+
+    def _ring(self, p, cx, cy, on: bool) -> None:
+        """Hawthorn's ring: filled when chosen, a faint circle when not."""
+        from PyQt6.QtGui import QPen
+        p.save()
+        if on:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(232, 234, 238, int(0.95 * 255)))
+        else:
+            pen = QPen(QColor(141, 148, 162, int(0.45 * 255)))
+            pen.setWidthF(1.0)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(QPointF(cx, cy), 3.4, 3.4)
+        p.restore()
 
     def _busy(self, p, x, y) -> None:
         p.fillRect(QRectF(x, y, 90, 2), look.alpha(look.FAINT, 0.45))

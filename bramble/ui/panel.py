@@ -115,7 +115,7 @@ class Panel:
     def set_items(self, items: list[Item], jobs: list) -> None:
         old = {e.key: e for e in self._walk(self.entries)}
         entries: list[Entry] = []
-        if self.category.kind == "tv":
+        if any(it.episode for it in items):
             shows: dict[str, list[Item]] = {}
             for it in items:
                 shows.setdefault(it.episode.show if it.episode else it.title, []).append(it)

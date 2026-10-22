@@ -234,6 +234,31 @@ def classify(path: Path, category: str | None = None) -> str:
     return "other"
 
 
+# What a category is for, judged from its name (any case): films, shows, games, music, books.
+CATEGORY_WORDS = {
+    "movies": ("movies", "movie", "films", "film", "cinema"),
+    "tv": ("tv shows", "tv", "shows", "series", "tv series", "television"),
+    "games": ("video games", "games", "game", "gaming", "roms", "retro"),
+    "music": ("music", "songs", "albums", "audio"),
+    "books": ("books", "book", "ebooks", "e-books", "reading", "comics", "audiobooks"),
+}
+# The name Bramble gives a category it has to create for something that arrived.
+DEFAULT_NAME = {"movies": "movies", "tv": "tv shows", "games": "video games", "music": "music",
+                "books": "books", "other": "other"}
+GROUP_OF_KIND = {"movie": "movies", "episode": "tv", "music": "music", "rom": "games",
+                 "game_windows": "games", "game_linux": "games", "document": "books",
+                 "program": "other", "installer": "other", "image": "other", "archive": "other",
+                 "other": "other"}
+
+
+def group_of_name(name: str) -> str:
+    low = name.strip().lower()
+    for group, words in CATEGORY_WORDS.items():
+        if low in words:
+            return group
+    return "custom"
+
+
 # Where a newly arrived file should be filed, by kind.
 CATEGORY_FOR_KIND = {
     "movie": "Movies", "episode": "TV Shows", "music": "Music",

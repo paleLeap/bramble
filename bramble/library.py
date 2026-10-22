@@ -290,12 +290,9 @@ def scan_inbox(settings, library_items: list[Item]) -> list[Item]:
 
 # --- categories (the window's list) ------------------------------------------------
 
-KIND_OF = {"Movies": "movies", "TV Shows": "tv", "Video Games": "games", "Music": "music"}
-
-
 @dataclass
 class Category:
-    name: str                       # the folder's name in MARROW
+    name: str                       # the folder's name in MARROW, as the person typed it
     folders: list[Path]             # that folder in every library root that has it
     home: Path                      # where new things for it go
 
@@ -305,58 +302,79 @@ class Category:
 
     @property
     def kind(self) -> str:
-        return KIND_OF.get(self.name, "custom")
+        """movies, tv, games, music, books, or custom: from the name, for sorting only."""
+        return kinds.group_of_name(self.name)
 
 
 def categories(settings) -> list[Category]:
-    """The four, then every other folder found in a MARROW, in name order."""
-    roots = [r for r in library_roots(settings)]
+    """Every folder in a MARROW, in the order the person made them (then by name)."""
+    roots = library_roots(settings)
     home_root = roots[0] if roots else paths.local_marrow()
-    names = list(paths.CATEGORIES)
-    extra: set[str] = set()
+    names: dict[str, str] = {}
     for r in roots:
         try:
             for d in r.iterdir():
-                if d.is_dir() and not d.name.startswith((".", "$")) and d.name not in names:
-                    extra.add(d.name)
+                if d.is_dir() and not d.name.startswith((".", "$")):
+                    names.setdefault(d.name.lower(), d.name)
         except OSError:
             continue
-    names += sorted(extra, key=str.lower)
-    return [Category(n, [r / n for r in roots if (r / n).is_dir()], home_root / n) for n in names]
+    order = [n.lower() for n in settings["category_order"]]
+    ordered = sorted(names, key=lambda k: (order.index(k) if k in order else len(order), k))
+    out = []
+    for k in ordered:
+        n = names[k]
+        out.append(Category(n, [r / n for r in roots if (r / n).is_dir()], home_root / n))
+    return out
 
 
-def _scan_any(folder: Path, category: str, root: Path) -> list[Item]:
-    """A category Bramble has no rules for: every file, three folders deep."""
+JUNK = {".txt", ".nfo", ".url", ".website", ".html", ".htm", ".sfv", ".md5", ".torrent",
+        ".aria2", ".db", ".ini", ".log", ".xml", ".json", ".bramble-part"}
+
+
+def _scan_mixed(folder: Path, category: str, root: Path, depth: int = 0) -> list[Item]:
+    """A category holding anything: films, shows, songs, books, game folders, ROMs.
+    A folder with a program in it is one game; site adverts and leftovers are left out."""
     items: list[Item] = []
-    base = len(folder.parts)
-    for dirpath, dirnames, files in os.walk(folder):
-        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-        if len(Path(dirpath).parts) - base >= 3:
-            dirnames[:] = []
-        for f in files:
-            if f.startswith("."):
-                continue
-            p = Path(dirpath) / f
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            real = _strip_partial(p)
-            kind = kinds.classify(real, None)
-            title = re.sub(r"[_]+", " ", real.stem).strip() or real.name
-            items.append(Item(path=p, kind=kind, category=category, root=root, title=title,
-                              size=st.st_size, mtime=st.st_mtime, busy=_is_busy(p, st)))
+    try:
+        entries = sorted(folder.iterdir(), key=lambda p: p.name.lower())
+    except OSError:
+        return items
+    for p in entries:
+        if p.name.startswith("."):
+            continue
+        if p.is_dir():
+            if depth < 4 and not _is_grouping(p) and _looks_like_app(p):
+                g = _folder_game(p, "Video Games", root)
+                if g:
+                    g.category = category
+                    items.append(g)
+                    continue
+            if depth < 4:
+                items.extend(_scan_mixed(p, category, root, depth + 1))
+            continue
+        ext = _strip_partial(p).suffix.lower()
+        if ext in JUNK or ext in kinds.SUBTITLE or "sample" in p.name.lower():
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        if ext in kinds.IMAGE and st.st_size < (4 << 20):
+            continue                   # posters and site adverts, not pictures someone keeps
+        in_games = kinds.group_of_name(category) == "games" or bool(kinds.system_for(p))
+        it = _file_item(p, "Video Games" if in_games and ext not in kinds.VIDEO else None, root)
+        if it is None:
+            continue
+        if it.kind == "movie" and it.size < MIN_MOVIE and not it.episode:
+            if not kinds.EPISODE_RE.search(p.stem):
+                it.kind = "other"     # a clip, not a film
+        it.category = category
+        items.append(it)
     return items
 
 
 def scan_category(cat: Category) -> list[Item]:
     out: list[Item] = []
     for folder in cat.folders:
-        root = folder.parent
-        if cat.kind == "games":
-            out.extend(_scan_games_like(folder, cat.name, root))
-        elif cat.kind in ("movies", "tv", "music"):
-            out.extend(_scan_media(folder, cat.name, root))
-        else:
-            out.extend(_scan_any(folder, cat.name, root))
+        out.extend(_scan_mixed(folder, cat.name, folder.parent))
     return out
