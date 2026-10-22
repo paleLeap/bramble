@@ -28,6 +28,8 @@ DEFAULTS = {
     "downloads": [],
     # Where the search box looks: module names in bramble/sources (the owner's choice).
     "sources": [],
+    # Plugins switched off with the leaf beside the search box (by file name).
+    "sources_off": [],
 }
 
 

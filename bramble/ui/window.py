@@ -120,6 +120,10 @@ class BrambleWindow(QWidget):
         self.search.setPalette(pal)
         self.search.setFont(paint.font(look.LIST_PX))
         self.search.returnPressed.connect(self._search_go)
+        # the leaf: switches search sources on and off
+        self.leaf_k = anim.Prop(0.0, look.PANEL_IN_MS)
+        self.leaf_hover = anim.Prop(0.0, look.COLOR_MS, look.css_ease)
+        self.leaf_rows: list[tuple[str, str, bool]] = []
         self._place_search()
 
         self.entry = QLineEdit(self)
@@ -444,6 +448,8 @@ class BrambleWindow(QWidget):
         wing = self.wing
         wing.open_results(query)
         names = list(self.settings["sources"])
+        off = set(self.settings["sources_off"])
+        self.close_leaf()
 
         def done(res, err):
             if wing.query != query:
@@ -453,7 +459,7 @@ class BrambleWindow(QWidget):
                 return
             note = "" if res.results else ("Nothing found." if not res.errors else " ".join(res.errors))
             wing.set_results(res.results, note)
-        self.run(lambda: sources.search(query, names), done)
+        self.run(lambda: sources.search(query, names, off), done)
 
     def add_plugin(self, ref: str) -> None:
         """A search plugin's address (or file) given to Bramble: keep it for searching."""
@@ -466,6 +472,99 @@ class BrambleWindow(QWidget):
             else:
                 self._say(f"added {name} to search", secs=8)
         self.run(lambda: plugins.install(ref), done)
+
+    # --- the leaf: search sources on and off ---------------------------------------
+    def _leaf_centre(self) -> QPointF:
+        g = self.search.geometry()
+        return QPointF(g.left() - 13, g.center().y() + 1)
+
+    def _leaf_card(self) -> QRectF:
+        g = self.search.geometry()
+        n = max(1, len(self.leaf_rows))
+        h = min(n, 8) * look.ROW + 2 * 10
+        w = 190
+        return QRectF(g.right() - w, g.top() - 12 - h, w, h)
+
+    def toggle_leaf(self) -> None:
+        if self.leaf_k.target > 0.5:
+            self.close_leaf()
+            return
+        self.leaf_rows = sources.catalog(self.settings)
+        self.leaf_k.set(1.0, look.PANEL_IN_MS)
+
+    def close_leaf(self) -> None:
+        self.leaf_k.set(0.0, look.PANEL_OUT_MS)
+
+    def flip_source(self, key: str) -> None:
+        if key.startswith("builtin:"):
+            name = key.split(":", 1)[1]
+            chosen = list(self.settings["sources"])
+            self.settings["sources"] = ([n for n in chosen if n != name] if name in chosen
+                                        else chosen + [name])
+        else:
+            off = list(self.settings["sources_off"])
+            self.settings["sources_off"] = ([k for k in off if k != key] if key in off
+                                            else off + [key])
+        self.leaf_rows = sources.catalog(self.settings)
+
+    def _paint_leaf(self, p: QPainter) -> None:
+        from PyQt6.QtGui import QPainterPath, QPen
+        c = self._leaf_centre()
+        k = self.leaf_k.value
+        col = look.mix(look.FAINT, look.TEXT, max(self.leaf_hover.value, k))
+        # a small leaf: two curves from stem to tip, a midrib, and a short stem
+        base, tip = QPointF(c.x() - 4, c.y() + 4), QPointF(c.x() + 4.5, c.y() - 4.5)
+        path = QPainterPath(base)
+        path.quadTo(QPointF(c.x() - 5, c.y() - 5), tip)
+        path.quadTo(QPointF(c.x() + 5, c.y() + 5), base)
+        pen = QPen(col)
+        pen.setWidthF(0.9)
+        p.save()
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+        p.drawLine(base, QPointF(c.x() + 2, c.y() - 2))
+        p.drawLine(base, QPointF(base.x() - 2, base.y() + 2))
+        p.restore()
+        self.regions.append((QRectF(c.x() - 10, c.y() - 10, 20, 20), "leaf", self.toggle_leaf))
+        if k <= 0.01:
+            return
+        card = self._leaf_card()
+        r = card.translated(0, 10 * (1 - look.ease(k)))
+        p.save()
+        p.setOpacity(k)
+        for s_ in range(look.SHADOW, 0, -1):
+            a = 0.05 * (1 - s_ / (look.SHADOW + 1))
+            p.fillPath(paint.rounded(r.adjusted(-s_, -s_ + 2, s_, s_ + 2), look.RADIUS + s_),
+                       QColor(0, 0, 0, int(255 * a)))
+        p.setClipPath(paint.rounded(r), Qt.ClipOperation.IntersectClip)
+        self.bg.paint(p, r, look.GLASS_SCRIM, blur=True, canvas=self.canvas())
+        y = r.top() + 10
+        if not self.leaf_rows:
+            paint.draw_text(p, r.left() + 12, y + 4, "none added yet", look.NOTE_PX, look.FAINT)
+        for key, name, on in self.leaf_rows[:8]:
+            hv = 1.0 if self.hover_key == "src:" + key else 0.0
+            colr = look.mix(look.TEXT if on else look.FAINT, look.TEXT, hv)
+            label = paint.elide(name, look.LIST_PX, r.width() - 46)
+            paint.draw_text(p, r.left() + 12, y + 3, label, look.LIST_PX, colr, glow=hv * 0.6)
+            # Hawthorn's ring: filled when on, a faint circle when off
+            cx, cy = r.right() - 16, y + look.ROW / 2 + 0.5
+            p.save()
+            if on:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(232, 234, 238, int(0.95 * 255)))
+            else:
+                ring = QPen(QColor(141, 148, 162, int(0.45 * 255)))
+                ring.setWidthF(1.0)
+                p.setPen(ring)
+                p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(cx, cy), 3.4, 3.4)
+            p.restore()
+            if k > 0.5:
+                self.regions.append((QRectF(r.left() + 4, y, r.width() - 8, look.ROW), "src:" + key,
+                                     lambda key=key: self.flip_source(key)))
+            y += look.ROW
+        p.restore()
 
     def choose_result(self, r, row_y: float) -> None:
         """A torrent clicked in the results window: download it into the holding folder
@@ -616,6 +715,7 @@ class BrambleWindow(QWidget):
         self.update()
         busy = (self.timeline.moving or any(r.moving() for r in self.rows) or self.brand_a.moving or self.brand_k.moving or self.close_hover.moving or self.returning
                 or self.notice_a.moving or any(not j.finished for j in self.downloads.jobs)
+                or self.leaf_k.moving or self.leaf_hover.moving
                 or self.wing.moving()
                 or (self.panel and self.panel.moving()))
         self.timer.setInterval(16 if busy else 33)
@@ -634,6 +734,7 @@ class BrambleWindow(QWidget):
         self._paint_rows(p)
         self._paint_card(p)
         self._paint_notice(p)
+        self._paint_leaf(p)
         self._paint_close(p, w)
         p.end()
 
@@ -816,6 +917,7 @@ class BrambleWindow(QWidget):
                 r.mark.set(1.0 if on else 0.0)
             self._settle()
             self.close_hover.set(1.0 if key == "close" else 0.0)
+            self.leaf_hover.set(1.0 if key == "leaf" else 0.0)
             if self.panel:
                 self.panel.hover(key)
         edges = self._edges(pos)
@@ -838,6 +940,8 @@ class BrambleWindow(QWidget):
             return
         pos = ev.position()
         key, fn = self._hit(pos)
+        if self.leaf_k.target > 0.5 and not (key == "leaf" or (key or "").startswith("src:")):
+            self.close_leaf()
         if fn:
             fn()
             return
@@ -863,6 +967,9 @@ class BrambleWindow(QWidget):
         if ev.key() == Qt.Key.Key_Escape and self.search.hasFocus():
             self.search.clear()
             self.setFocus()
+            return
+        if ev.key() == Qt.Key.Key_Escape and self.leaf_k.target > 0.5:
+            self.close_leaf()
             return
         if ev.key() == Qt.Key.Key_Escape and (self.wing.results_card.tl.opening
                                                or self.wing.dl_card.tl.opening):

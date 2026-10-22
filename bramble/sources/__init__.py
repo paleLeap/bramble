@@ -73,8 +73,29 @@ def load(name: str):
     return importlib.import_module(f"bramble.sources.{name}").SOURCE
 
 
-def search(query: str, names: list[str]) -> Outcome:
-    """Ask every chosen built-in source and every plugin found, all at once."""
+def catalog(settings) -> list[tuple[str, str, bool]]:
+    """Every search source Bramble knows, for the leaf's list: (key, name, on).
+    Built-in sources are off unless chosen; plugins are on unless switched off."""
+    from . import plugins
+    rows = []
+    for n in available():
+        try:
+            rows.append(("builtin:" + n, load(n).name, n in settings["sources"]))
+        except Exception:
+            continue
+    off = set(settings["sources_off"])
+    for path in plugins.found():
+        try:
+            m = re.search(r"""^\s*name\s*=\s*["']([^"']+)["']""", path.read_text(errors="replace"), re.M)
+        except OSError:
+            m = None
+        rows.append((path.stem, m.group(1) if m else path.stem, path.stem not in off))
+    return rows
+
+
+def search(query: str, names: list[str], off: set | None = None) -> Outcome:
+    """Ask every chosen built-in source and every plugin found (and not switched off),
+    all at once."""
     from . import plugins
     out = Outcome()
     engines = []
@@ -83,7 +104,7 @@ def search(query: str, names: list[str]) -> Outcome:
             engines.append(load(n))
         except Exception as e:
             out.errors.append(f"{n}: {e}")
-    found, errs = plugins.load_all()
+    found, errs = plugins.load_all(skip=off or set())
     engines += found
     out.errors += errs
     if not engines:

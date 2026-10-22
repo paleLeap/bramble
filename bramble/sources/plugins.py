@@ -14,6 +14,7 @@ import importlib.util
 import io
 import re
 import sys
+import threading
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -22,6 +23,45 @@ from .. import paths
 from . import Result, parse_size, quality_of
 
 _NOVA = Path(__file__).resolve().parent / "_nova"
+
+
+class _PerThreadStdout:
+    """Plugins print what they find. Several run at once, so what each one prints must
+    go to its own buffer; swapping sys.stdout per call (redirect_stdout) is global and
+    the threads would trample each other's."""
+
+    def __init__(self, real):
+        self.real = real
+        self.local = threading.local()
+
+    def write(self, text):
+        buf = getattr(self.local, "buf", None)
+        return (buf or self.real).write(text)
+
+    def flush(self):
+        buf = getattr(self.local, "buf", None)
+        (buf or self.real).flush()
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+
+_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _captured():
+    """Collect what this thread prints, without touching other threads' output."""
+    with _lock:
+        if not isinstance(sys.stdout, _PerThreadStdout):
+            sys.stdout = _PerThreadStdout(sys.stdout)
+    out = sys.stdout
+    buf = io.StringIO()
+    out.local.buf = buf
+    try:
+        yield buf
+    finally:
+        out.local.buf = None
 
 
 def folders() -> list[Path]:
@@ -74,8 +114,8 @@ class Plugin:
     def search(self, query: str) -> list[Result]:
         import novaprinter                      # the shim in _nova
         rows: list[dict] = []
-        novaprinter.collect(rows)
-        with contextlib.redirect_stdout(io.StringIO()):
+        novaprinter.collect(rows, type(self.engine).__module__)
+        with _captured():
             self.engine.search(urllib.parse.quote(query), "all")
         out = []
         for d in rows:
@@ -96,9 +136,8 @@ class Plugin:
         fn = getattr(self.engine, "download_torrent", None)
         if fn is None:
             return ""                     # a page, and no way to turn it into a torrent
-        buf = io.StringIO()
         try:
-            with contextlib.redirect_stdout(buf):
+            with _captured() as buf:
                 fn(link)
         except Exception:
             return ""
@@ -109,9 +148,11 @@ class Plugin:
         return ""                         # it answered with nothing usable
 
 
-def load_all() -> tuple[list[Plugin], list[str]]:
+def load_all(skip: set = frozenset()) -> tuple[list[Plugin], list[str]]:
     plugins, errors = [], []
     for p in found():
+        if p.stem in skip:
+            continue
         try:
             plugins.append(Plugin(p))
         except Exception as e:
