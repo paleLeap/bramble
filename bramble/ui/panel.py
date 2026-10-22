@@ -42,6 +42,7 @@ class Entry:
     children: list["Entry"] = field(default_factory=list)   # a show's episodes
     depth: int = 0
     download: object | None = None                           # downloads.Job or CopyJob
+    result: object | None = None                             # sources.Result (search card)
     hover: anim.Prop = field(default_factory=lambda: anim.Prop(0.0, look.COLOR_MS, look.css_ease))
     grow: anim.Prop = field(default_factory=lambda: anim.Prop(0.0, look.GROW_MS))   # px of info shown
     turn: anim.Prop = field(default_factory=lambda: anim.Prop(0.0, look.MOVE_MS))   # + -> -
@@ -108,6 +109,8 @@ class Panel:
         self.add_hover = anim.Prop(0.0, look.MARK_MS, look.css_ease)
         self.close_hover = anim.Prop(0.0, look.COLOR_MS, look.css_ease)
         self.regions: list[tuple[QRectF, str, Callable[[], None]]] = []
+        self.note = ""                        # a line shown when a list is empty or searching
+        self.searching = False
 
     # --- content ------------------------------------------------------------------
     def set_items(self, items: list[Item], jobs: list) -> None:
@@ -131,6 +134,19 @@ class Panel:
             if e.key in old:                  # keep animations running across a rescan
                 e.hover, e.grow, e.turn = old[e.key].hover, old[e.key].grow, old[e.key].turn
         self.entries = entries
+
+    def set_results(self, results: list, jobs_by_link: dict, note: str = "") -> None:
+        """The search card: one line per torrent found; a started one carries its job."""
+        old = {e.key: e for e in self.entries}
+        out = []
+        for r in results:
+            title = re.sub(r"[_]+", " ", r.title).strip()
+            e = Entry("result:" + r.link, title, None, result=r, download=jobs_by_link.get(r.link))
+            if e.key in old:
+                e.hover, e.grow = old[e.key].hover, old[e.key].grow
+            out.append(e)
+        self.entries = out
+        self.note = note
 
     @staticmethod
     def _walk(entries):
@@ -162,6 +178,13 @@ class Panel:
                 self.open_groups.add(e.key)
                 e.turn.set(1.0)
                 self.preload()
+            return
+        if e.result is not None:
+            job = e.download
+            if job is None:
+                self.host.download_result(e)
+            elif getattr(job, "stage", "") == "ready" and job.landed:
+                self.host.play_path(job.landed, self)
             return
         if e.item is not None:
             self.host.play(e.item, self)
@@ -262,7 +285,15 @@ class Panel:
                 last_title, last_x = e.title, x0 + e.depth * look.HANG
                 if e.group:
                     last_x += look.MARKER_W
-            y = self._paint_add(p, x0, last_x, last_title, y, width, inner)
+            if self.searching:
+                self._busy(p, x0, y + ROW / 2)
+                y += ROW
+            elif self.note:
+                for chunk in self._wrap(self.note, look.NOTE_PX, width):
+                    paint.draw_text(p, x0, y + 4, chunk, look.NOTE_PX, look.FAINT)
+                    y += LINE_H
+            if self.category.kind != "search":
+                y = self._paint_add(p, x0, last_x, last_title, y, width, inner)
         self.content_h = y + self.scroll - inner.top()
         self.view_h = inner.height()
         p.restore()
@@ -318,9 +349,25 @@ class Panel:
         k = self.hover_key or ""
         return k == "entry:" + e.key or k.startswith(f"fix:{e.key}:")
 
+    def _result_line(self, r) -> str:
+        bits = [b for b in (r.quality, _size(r.size),
+                            f"{r.seeders} seeders" if r.seeders >= 0 else "", r.source) if b]
+        return "  ·  ".join(bits)
+
+    def _held_fixes(self, job) -> list:
+        return [checks.Fix("Keep it anyway", run=lambda j=job: self.host.keep_held(j)),
+                checks.Fix("Throw it away", run=lambda j=job: self.host.discard_held(j))]
+
     def _info_height(self, e: Entry, width: float) -> float:
         """The same for every title of a kind, known before anything has loaded, so the
         one closing and the one opening trade height evenly and the list holds still."""
+        if e.result is not None:
+            job = e.download
+            if job is not None and getattr(job, "stage", "") == "held":
+                return 2 + LINE_H + self._error_h(job.reasons, width, True) + 4
+            if job is not None and job.failed:
+                return 2 + LINE_H + self._error_h([job.error], width, False) + 4
+            return 2 + LINE_H + 8
         if e.download is not None:
             if e.download.failed:
                 return self._error_h([e.download.error], width,
@@ -342,6 +389,15 @@ class Panel:
         return h
 
     def _paint_info(self, p, e: Entry, x, y, width) -> None:
+        if e.result is not None:
+            paint.draw_text(p, x, y + 2, self._result_line(e.result), look.NOTE_PX, look.FAINT)
+            y += 2 + LINE_H
+            job = e.download
+            if job is not None and getattr(job, "stage", "") == "held":
+                self._error_box(p, e, x, y, width, job.reasons, self._held_fixes(job), None)
+            elif job is not None and job.failed:
+                self._error_box(p, e, x, y, width, [job.error], [], None)
+            return
         if e.download is not None:
             if e.download.failed:
                 needs = getattr(e.download, "needs", "")
@@ -526,3 +582,13 @@ class Panel:
     def back(self) -> bool:
         """Esc inside the card. True if it used the key."""
         return self.cancel_adding()
+
+
+def _size(n: int) -> str:
+    if not n:
+        return ""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB", "MB") else f"{n:.1f} {unit}"
+        n /= 1024
+    return ""

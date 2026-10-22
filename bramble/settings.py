@@ -26,6 +26,8 @@ DEFAULTS = {
     "file_to": {},
     # Unfinished downloads, resumed when Bramble opens: [{link, folder}].
     "downloads": [],
+    # Where the search box looks: module names in bramble/sources (the owner's choice).
+    "sources": [],
 }
 
 

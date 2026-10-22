@@ -7,6 +7,7 @@ next time Bramble opens (aria2 --continue picks up where it stopped).
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 import threading
 import uuid
@@ -63,11 +64,18 @@ class Job:
     error: str = ""
     needs: str = ""                  # a tool id whose absence caused the failure
     proc: subprocess.Popen | None = None
+    marrow: Path | None = None       # held downloads: the library they are filed into
+    stage: str = ""                  # "checking", "ready", "held" once the download is done
+    reasons: list = field(default_factory=list)   # why a held one was held
+    landed: Path | None = None       # where a ready one went
+    kind: str = ""
 
     @property
     def state_text(self) -> str:
         if self.failed:
             return "failed"
+        if self.stage:
+            return self.stage
         if self.finished:
             return "done"
         return f"{self.percent}%" if self.percent >= 0 else "starting"
@@ -91,14 +99,21 @@ class Downloads:
         for d in self.settings["downloads"]:
             folder = Path(d["folder"])
             if folder.is_dir():
-                self.start(d["link"], folder, remember=False)
+                self.start(d["link"], folder, remember=False,
+                           marrow=Path(d["marrow"]) if d.get("marrow") else None,
+                           title=d.get("title", ""))
 
     def _remember(self) -> None:
-        self.settings["downloads"] = [{"link": j.link, "folder": str(j.folder)}
-                                      for j in self.jobs if not j.finished]
+        self.settings["downloads"] = [
+            {"link": j.link, "folder": str(j.folder), "title": j.title,
+             **({"marrow": str(j.marrow)} if j.marrow else {})}
+            for j in self.jobs if not j.finished]
 
-    def start(self, link: str, folder: Path, remember: bool = True) -> Job:
-        job = Job(link.strip(), folder, title_of(link))
+    def start(self, link: str, folder: Path, remember: bool = True, marrow: Path | None = None,
+              title: str = "") -> Job:
+        """Download into `folder`. With `marrow`, `folder` is a holding folder: when the
+        download finishes it is checked (vet.py) and filed into that library."""
+        job = Job(link.strip(), folder, title or title_of(link), marrow=marrow)
         self.jobs.append(job)
         if remember:
             self._remember()
@@ -112,7 +127,7 @@ class Downloads:
         folder.mkdir(parents=True, exist_ok=True)
         args = cmd + [f"--dir={folder}", "--continue=true", "--seed-time=0",
                       "--summary-interval=1", "--console-log-level=error",
-                      "--file-allocation=none", "--enable-color=false",
+                      "--enable-color=false",   # (file-allocation=none/trunc stall web-seeded torrents)
                       "--bt-save-metadata=false", "--auto-file-renaming=false",
                       "--allow-overwrite=false", job.link]
         try:
@@ -136,10 +151,13 @@ class Downloads:
             if line.strip():
                 tail = (tail + [line.strip()])[-6:]
         code = job.proc.wait()
-        job.finished = True
         if code == 0:
             job.percent = 100
+            if job.marrow is not None:
+                self._vet(job)
+            job.finished = True
         else:
+            job.finished = True
             job.failed = True
             job.error = REASONS.get(code, f"aria2 stopped (code {code}).")
             detail = next((t for t in reversed(tail) if "error" in t.lower() or "exception" in t.lower()), "")
@@ -147,6 +165,43 @@ class Downloads:
                 job.error += " " + detail[:200]
         self._remember()
         self.on_change(job)
+
+    def _vet(self, job: Job) -> None:
+        """Check what arrived in the holding folder; file it, or hold it with reasons."""
+        from . import vet
+        job.stage = "checking"
+        try:
+            inside = [p for p in job.folder.iterdir() if not p.name.endswith(".aria2")]
+            root = inside[0] if len(inside) == 1 else job.folder
+            v = vet.check(root)
+            job.kind = v.kind
+            if v.ok:
+                job.landed = _named(vet.file_into_library(root, v, job.marrow), job.title)
+                job.stage = "ready"
+                shutil.rmtree(job.folder, ignore_errors=True)   # what is left: site adverts
+            else:
+                job.stage = "held"
+                job.reasons = v.reasons
+        except Exception as e:
+            job.stage = "held"
+            job.reasons = [f"Could not check it: {e}"]
+
+    def keep_anyway(self, job: Job) -> None:
+        """The person looked at a held download and chose to keep it."""
+        from . import vet
+        inside = [p for p in job.folder.iterdir() if not p.name.endswith(".aria2")]
+        root = inside[0] if len(inside) == 1 else job.folder
+        v = vet.check(root)
+        v.keep = v.keep or [p for p in root.rglob("*") if p.is_file()] if root.is_dir() else [root]
+        job.landed = vet.file_into_library(root, v, job.marrow)
+        job.stage, job.reasons = "ready", []
+        shutil.rmtree(job.folder, ignore_errors=True)
+
+    def throw_away(self, job: Job) -> None:
+        """Delete a held download. Only ever inside Bramble's own holding folder."""
+        if job.marrow is not None and ".holding" in job.folder.parts:
+            shutil.rmtree(job.folder, ignore_errors=True)
+        self.jobs = [j for j in self.jobs if j is not job]
 
     def retry_failed(self) -> None:
         """Start every failed download again (after its problem was fixed)."""
@@ -163,3 +218,16 @@ class Downloads:
     def for_folder(self, folders: list[Path]) -> list[Job]:
         keys = {str(f) for f in folders}
         return [j for j in self.jobs if str(j.folder) in keys and not (j.finished and not j.failed)]
+
+
+def _named(path: Path, title: str) -> Path:
+    """A single file from a search keeps the result's name, not the site's code name
+    ("ava11109vnb1.mpeg" becomes "Duck and Cover.mpeg")."""
+    if not path.is_file() or not title:
+        return path
+    clean = re.sub(r'[\\/:*?"<>|]+', " ", title).strip()
+    target = path.with_name(clean + path.suffix)
+    if target != path and not target.exists():
+        path.rename(target)
+        return target
+    return path

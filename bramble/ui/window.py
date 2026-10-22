@@ -21,7 +21,7 @@ from PyQt6.QtCore import QObject, QPointF, QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter
 from PyQt6.QtWidgets import QLineEdit, QWidget
 
-from .. import downloads, fetch, kinds, launcher, library, paths, system, tools
+from .. import downloads, fetch, kinds, launcher, library, notify, paths, sources, system, tools
 from . import anim, look, paint
 from .background import Background
 from .panel import Panel
@@ -68,6 +68,20 @@ class CopyJob:
         return "failed" if self.failed else "done" if self.finished else "copying"
 
 
+class SearchCategory:
+    """The search card behaves like a category whose name is what was typed."""
+    kind = "search"
+
+    def __init__(self, query: str):
+        self.name = query
+        self.folders: list[Path] = []
+        self.home = Path()
+
+    @property
+    def label(self) -> str:
+        return self.name.lower()
+
+
 class BrambleWindow(QWidget):
     def __init__(self, settings):
         super().__init__(None, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
@@ -99,7 +113,29 @@ class BrambleWindow(QWidget):
         self._bridge = _Bridge()
         self._bridge.done.connect(lambda t: t[0](t[1], t[2]))
         self.downloads = downloads.Downloads(settings, lambda job: self._bridge.done.emit(
-            (lambda *_: self.refresh_panel(), None, None)))
+            (lambda *_: self._job_ended(job), None, None)))
+        self.search_row = Row(None)              # the search card's title line, at the top row
+        self.search_row.op.jump(0.0)
+        self.results: list = []
+        self.notice = ""                         # bottom left: progress, and "... is ready"
+        self.notice_a = anim.Prop(0.0, look.COLOR_MS * 2, look.css_ease)
+        self.notice_until = 0.0
+        self.notice_target: Path | None = None
+
+        self.search = QLineEdit(self)
+        self.search.setFrame(False)
+        self.search.setPlaceholderText("search")
+        self.search.setStyleSheet(
+            f"QLineEdit {{ background: transparent; color: {look.TEXT.name()}; border: none;"
+            f" border-bottom: 1px solid {look.alpha(look.FAINT, 0.7).name(QColor.NameFormat.HexArgb)};"
+            f" padding: 0px; }}")
+        from PyQt6.QtGui import QPalette
+        pal = self.search.palette()
+        pal.setColor(QPalette.ColorRole.PlaceholderText, look.FAINT)
+        self.search.setPalette(pal)
+        self.search.setFont(paint.font(look.LIST_PX))
+        self.search.returnPressed.connect(self._search_go)
+        self._place_search()
 
         self.entry = QLineEdit(self)
         self.entry.hide()
@@ -166,11 +202,24 @@ class BrambleWindow(QWidget):
                 r.scale.set(1.0)
                 r.open.set(0.0)
                 r.turn.set(0.0)
+        sr = self.search_row
+        if self.open_row is sr:
+            sr.x.set(look.STEP)
+            sr.op.set(1.0)
+            sr.scale.set(look.OPEN_SCALE)
+            sr.open.set(1.0)
+            sr.turn.set(1.0)
+        else:
+            sr.op.set(0.0)
+            sr.turn.set(0.0)
         opened = self.open_row is not None
         self.brand_k.set(1.0 if opened else 0.0)
         self.brand_a.set(look.TEXT_GHOST if opened else look.TEXT_SOFT)
 
     def toggle(self, row: Row) -> None:
+        if row is self.search_row:
+            self.close_category()
+            return
         if row.cat is None:
             self.start_entry("category")
             return
@@ -207,6 +256,9 @@ class BrambleWindow(QWidget):
         if not self.panel:
             return
         panel = self.panel
+        if panel.category.kind == "search":
+            self._show_results(panel)
+            return
         cat = panel.category
 
         def work():
@@ -381,7 +433,7 @@ class BrambleWindow(QWidget):
             ok = (not err) and res and res[0]
             if item is None:
                 # a download's fix: once the missing program is here, try the downloads again
-                if ok:
+                if ok and f.download:
                     self.downloads.retry_failed()
                 self.refresh_panel()
                 return
@@ -395,6 +447,100 @@ class BrambleWindow(QWidget):
             else:
                 info.error = [msg] if msg else []
         self.run(work, done)
+
+    # --- search --------------------------------------------------------------------
+    def _place_search(self) -> None:
+        w, h = self.width(), self.height()
+        sw = 130
+        self.search.setGeometry(int(w - 14 - sw), int(h - 14 - 20), sw, 20)
+
+    def resizeEvent(self, ev) -> None:
+        self._place_search()
+        super().resizeEvent(ev)
+
+    def _search_go(self) -> None:
+        query = self.search.text().strip()
+        if not query:
+            return
+        self.hide_entry()
+        if self.panel:
+            self.panel.cancel_adding()
+        cat = SearchCategory(query)
+        panel = Panel(self, cat)
+        panel.searching = True
+        self.returning = False
+        self.open_row = self.search_row
+        self.shown_row = self.search_row
+        self.search_row.cat = cat
+        self.panel = panel
+        self.timeline.open()
+        self._settle()
+        names = list(self.settings["sources"])
+
+        def done(res, err):
+            panel.searching = False
+            if err or res is None:
+                panel.note = f"The search did not work: {err}"
+                return
+            self.results = res.results
+            panel.note = "" if res.results else ("Nothing found." if not res.errors else
+                                                 " ".join(res.errors))
+            self._show_results(panel)
+        self.run(lambda: sources.search(query, names), done)
+
+    def _show_results(self, panel: Panel) -> None:
+        jobs = {j.link: j for j in self.downloads.jobs if j.marrow is not None}
+        panel.set_results(self.results, jobs, panel.note)
+
+    def _marrow(self) -> Path:
+        """The library that downloads are filed into: the drive's when it is plugged in."""
+        roots = library.library_roots(self.settings)
+        return roots[0] if roots else paths.local_marrow()
+
+    def download_result(self, e) -> None:
+        r = e.result
+        marrow = self._marrow()
+        import uuid
+        holding = marrow / ".holding" / uuid.uuid4().hex[:10]
+        holding.mkdir(parents=True, exist_ok=True)
+        title = kinds._tidy(r.title)
+        e.download = self.downloads.start(r.link, holding, marrow=marrow, title=title)
+        self._say(f"{title} is downloading")
+
+    def play_path(self, path: Path, panel: Panel) -> None:
+        cat_name = path.relative_to(self._marrow()).parts[0] if self._marrow() in path.parents else None
+        items = []
+        for c in library.categories(self.settings):
+            if c.name == cat_name:
+                items = library.scan_category(c)
+        hit = next((i for i in items if i.path == path or path in i.path.parents
+                    or i.path in path.parents or i.path.parent == path), None)
+        if hit:
+            self.play(hit, panel)
+
+    def keep_held(self, job):
+        self.downloads.keep_anyway(job)
+        self._job_ended(job)
+        return True, ""
+
+    def discard_held(self, job):
+        self.downloads.throw_away(job)
+        return True, ""
+
+    def _job_ended(self, job) -> None:
+        if getattr(job, "stage", "") == "ready":
+            name = job.title
+            self._say(f"{name} is ready", target=job.landed)
+            notify.send("bramble", f"{name} is ready")
+        elif getattr(job, "stage", "") == "held":
+            self._say(f"{job.title} is being held")
+        self.refresh_panel()
+
+    def _say(self, text: str, target: Path | None = None, secs: float = 8.0) -> None:
+        self.notice = text
+        self.notice_target = target
+        self.notice_until = anim.now() + secs
+        self.notice_a.set(1.0)
 
     def _tools_destination(self) -> Path:
         for drive in paths.find_drives():
@@ -423,9 +569,10 @@ class BrambleWindow(QWidget):
         """The card: centred across the window under the chosen line, a fixed height
         (it never resizes while open; only the hovered title grows inside it)."""
         row = self.shown_row
-        if row is None or row not in self.rows:
+        if row is None or (row not in self.rows and row is not self.search_row):
             return None
-        top = self._row_y(self.rows.index(row)) + look.ROW + 12
+        index = 0 if row is self.search_row else self.rows.index(row)
+        top = self._row_y(index) + look.ROW + 12
         w, h = self.width(), self.height()
         height = max(look.ROW * 2 + 2 * look.CARD_PAD, h - top - look.CARD_BOTTOM)
         return QRectF(look.CARD_MARGIN, top, w - 2 * look.CARD_MARGIN, height)
@@ -441,6 +588,7 @@ class BrambleWindow(QWidget):
             self.shown_row = None
         self.update()
         busy = (self.timeline.moving or any(r.moving() for r in self.rows) or self.brand_a.moving or self.brand_k.moving or self.close_hover.moving or self.returning
+                or self.notice_a.moving or any(not j.finished for j in self.downloads.jobs)
                 or (self.panel and self.panel.moving()))
         self.timer.setInterval(16 if busy else 33)
 
@@ -456,7 +604,9 @@ class BrambleWindow(QWidget):
         self.regions = []
         self._paint_brand(p)
         self._paint_rows(p)
+        self._paint_search_row(p)
         self._paint_card(p)
+        self._paint_notice(p)
         self._paint_close(p, w)
         p.end()
 
@@ -529,6 +679,70 @@ class BrambleWindow(QWidget):
                 hit = QRectF(x - 4, y, (look.MARKER_W + tw) * s + 10, look.ROW)
                 self.regions.append((hit, f"row:{i}", lambda r=r: self.toggle(r)))
 
+    def _paint_search_row(self, p: QPainter) -> None:
+        r = self.search_row
+        op = r.op.value
+        if op <= 0.002 or r.cat is None:
+            return
+        f = paint.font(look.MENU_PX, look.MENU_WEIGHT, look.MENU_TRACK)
+        y = self._row_y(0)
+        x = self.x0 + r.x.value
+        s = r.scale.value
+        cy = y + look.ROW / 2
+        p.save()
+        p.setOpacity(op)
+        p.translate(x, cy)
+        p.scale(s, s)
+        p.translate(-x, -cy)
+        paint.draw_marker(p, x + paint.width("+", f) / 2, cy, look.MENU_PX, r.turn.value, look.DIM)
+        label = paint.elide(r.label, look.MENU_PX, self.width() - x - look.MARKER_W - 60)
+        tw = paint.draw_text(p, x + look.MARKER_W, cy - paint.text_height(f) / 2, label, look.MENU_PX,
+                             look.TEXT, look.MENU_WEIGHT, look.MENU_TRACK, glow=r.hover.value)
+        p.restore()
+        if op > 0.5:
+            self.regions.append((QRectF(x - 4, y, (look.MARKER_W + tw) * s + 10, look.ROW), "row:search",
+                                 lambda: self.toggle(self.search_row)))
+
+    def _paint_notice(self, p: QPainter) -> None:
+        """Bottom left, in Hawthorn's footer place: what is downloading, and what is ready."""
+        active = [j for j in self.downloads.jobs if j.marrow is not None and not j.finished]
+        if active and anim.now() > self.notice_until:
+            j = active[0]
+            more = f"  +{len(active) - 1}" if len(active) > 1 else ""
+            self.notice = f"{j.title}  {j.state_text}{more}"
+            self.notice_target = None
+            self.notice_a.set(1.0)
+        elif not active and anim.now() > self.notice_until:
+            self.notice_a.set(0.0)
+        a = self.notice_a.value
+        if a <= 0.01 or not self.notice:
+            return
+        h = self.height()
+        width = self.width() - 14 - 130 - 14 - 14
+        text = paint.elide(self.notice, look.NOTE_PX, width)
+        hv = 1.0 if self.hover_key == "notice" else 0.0
+        col = look.alpha(look.mix(look.DIM, look.TEXT, hv), a)
+        tw = paint.draw_text(p, 14, h - 14 - 16, text, look.NOTE_PX, col)
+        if self.notice_target is not None:
+            target = self.notice_target
+            self.regions.append((QRectF(14, h - 34, tw + 4, 20), "notice",
+                                 lambda t=target: self._open_landed(t)))
+
+    def _open_landed(self, target: Path) -> None:
+        """Clicking "... is ready": open the category it went into."""
+        try:
+            name = target.relative_to(self._marrow()).parts[0]
+        except ValueError:
+            return
+        row = next((r for r in self.rows if r.cat and r.cat.name == name), None)
+        if row is None:
+            self.set_categories(library.categories(self.settings))
+            row = next((r for r in self.rows if r.cat and r.cat.name == name), None)
+        if row is not None and self.open_row is not row:
+            if self.open_row is not None:
+                self.close_category()
+            QTimer.singleShot(1300 if self.shown_row else 0, lambda: self.toggle(row))
+
     def _paint_card(self, p: QPainter) -> None:
         card = self._card_geometry()
         if card is None or self.timeline.shut:
@@ -591,6 +805,7 @@ class BrambleWindow(QWidget):
                 r.mark.set(1.0 if on else 0.0)
             self._settle()
             self.close_hover.set(1.0 if key == "close" else 0.0)
+            self.search_row.hover.set(1.0 if key == "row:search" else 0.0)
             if self.panel:
                 self.panel.hover(key)
         edges = self._edges(pos)
@@ -635,6 +850,10 @@ class BrambleWindow(QWidget):
             self.panel.wheel(ev.angleDelta().y() / 120 * look.ROW * 2)
 
     def keyPressEvent(self, ev) -> None:
+        if ev.key() == Qt.Key.Key_Escape and self.search.hasFocus():
+            self.search.clear()
+            self.setFocus()
+            return
         if ev.key() == Qt.Key.Key_Escape:
             if self.entry.isVisible() and self.entry_for == "category":
                 self.hide_entry()
