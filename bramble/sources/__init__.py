@@ -94,7 +94,7 @@ def search(query: str, names: list[str]) -> Outcome:
         try:
             return engine.search(query), None
         except Exception as e:            # one broken site never spoils the others
-            return [], f"{getattr(engine, 'name', 'a source')}: {e}"
+            return [], f"{getattr(engine, 'name', 'a source')}: {_plainly(e)}"
 
     with ThreadPoolExecutor(max_workers=max(1, len(engines))) as pool:
         for results, err in pool.map(one, engines):
@@ -118,3 +118,19 @@ def resolve(r: Result) -> str:
     if r.plugin is not None:
         return r.plugin.resolve(r.link)
     return r.link
+
+
+def _plainly(e: Exception) -> str:
+    """A site's refusal in words, not an HTTP code."""
+    text = str(e)
+    code = getattr(e, "code", None)
+    if code in (401, 403, 429, 503):
+        return ("the site refused the search (it blocks programs that are not a web browser)"
+                if code != 429 else "the site asked for fewer searches; try again later")
+    if code == 404:
+        return "the site no longer has a search page there (the plugin may be out of date)"
+    if "timed out" in text.lower():
+        return "the site did not answer in time"
+    if "Name or service not known" in text or "getaddrinfo" in text:
+        return "the site could not be found (it may have moved, or there is no internet)"
+    return text
