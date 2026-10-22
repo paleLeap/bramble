@@ -27,6 +27,8 @@ class Result:
     seeders: int = -1           # -1 if the source does not say
     quality: str = ""           # 1080p, 2160p ...
     kind_hint: str = ""         # "movie", "episode", "music", "game" if the source says
+    page: str = ""              # the result's page on its site, when there is one
+    plugin: object = None       # the plugin that found it (to turn a page into a magnet)
 
 
 @dataclass
@@ -72,19 +74,30 @@ def load(name: str):
 
 
 def search(query: str, names: list[str]) -> Outcome:
+    """Ask every chosen built-in source and every plugin found, all at once."""
+    from . import plugins
     out = Outcome()
-    if not names:
+    engines = []
+    for n in names:
+        try:
+            engines.append(load(n))
+        except Exception as e:
+            out.errors.append(f"{n}: {e}")
+    found, errs = plugins.load_all()
+    engines += found
+    out.errors += errs
+    if not engines:
         out.errors.append("No search sources are set up yet.")
         return out
 
-    def one(name):
+    def one(engine):
         try:
-            return name, load(name).search(query), None
+            return engine.search(query), None
         except Exception as e:            # one broken site never spoils the others
-            return name, [], f"{name}: {e}"
+            return [], f"{getattr(engine, 'name', 'a source')}: {e}"
 
-    with ThreadPoolExecutor(max_workers=max(1, len(names))) as pool:
-        for name, results, err in pool.map(one, names):
+    with ThreadPoolExecutor(max_workers=max(1, len(engines))) as pool:
+        for results, err in pool.map(one, engines):
             out.results.extend(results or [])
             if err:
                 out.errors.append(err)
@@ -98,3 +111,10 @@ def search(query: str, names: list[str]) -> Outcome:
             uniq.append(r)
     out.results = uniq[:SHOW]
     return out
+
+
+def resolve(r: Result) -> str:
+    """The link aria2 can download: some plugins list a page and find the magnet on request."""
+    if r.plugin is not None:
+        return r.plugin.resolve(r.link)
+    return r.link

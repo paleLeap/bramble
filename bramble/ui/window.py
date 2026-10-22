@@ -25,6 +25,7 @@ from .. import downloads, fetch, kinds, launcher, library, notify, paths, source
 from . import anim, look, paint
 from .background import Background
 from .panel import Panel
+from .wing import WING_EXTRA, WING_W, Wing
 
 
 class _Bridge(QObject):
@@ -68,20 +69,6 @@ class CopyJob:
         return "failed" if self.failed else "done" if self.finished else "copying"
 
 
-class SearchCategory:
-    """The search card behaves like a category whose name is what was typed."""
-    kind = "search"
-
-    def __init__(self, query: str):
-        self.name = query
-        self.folders: list[Path] = []
-        self.home = Path()
-
-    @property
-    def label(self) -> str:
-        return self.name.lower()
-
-
 class BrambleWindow(QWidget):
     def __init__(self, settings):
         super().__init__(None, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
@@ -114,9 +101,7 @@ class BrambleWindow(QWidget):
         self._bridge.done.connect(lambda t: t[0](t[1], t[2]))
         self.downloads = downloads.Downloads(settings, lambda job: self._bridge.done.emit(
             (lambda *_: self._job_ended(job), None, None)))
-        self.search_row = Row(None)              # the search card's title line, at the top row
-        self.search_row.op.jump(0.0)
-        self.results: list = []
+        self.wing = Wing(self)                   # the search windows, outside to the right
         self.notice = ""                         # bottom left: progress, and "... is ready"
         self.notice_a = anim.Prop(0.0, look.COLOR_MS * 2, look.css_ease)
         self.notice_until = 0.0
@@ -202,24 +187,11 @@ class BrambleWindow(QWidget):
                 r.scale.set(1.0)
                 r.open.set(0.0)
                 r.turn.set(0.0)
-        sr = self.search_row
-        if self.open_row is sr:
-            sr.x.set(look.STEP)
-            sr.op.set(1.0)
-            sr.scale.set(look.OPEN_SCALE)
-            sr.open.set(1.0)
-            sr.turn.set(1.0)
-        else:
-            sr.op.set(0.0)
-            sr.turn.set(0.0)
         opened = self.open_row is not None
         self.brand_k.set(1.0 if opened else 0.0)
         self.brand_a.set(look.TEXT_GHOST if opened else look.TEXT_SOFT)
 
     def toggle(self, row: Row) -> None:
-        if row is self.search_row:
-            self.close_category()
-            return
         if row.cat is None:
             self.start_entry("category")
             return
@@ -256,9 +228,6 @@ class BrambleWindow(QWidget):
         if not self.panel:
             return
         panel = self.panel
-        if panel.category.kind == "search":
-            self._show_results(panel)
-            return
         cat = panel.category
 
         def work():
@@ -456,6 +425,8 @@ class BrambleWindow(QWidget):
 
     def resizeEvent(self, ev) -> None:
         self._place_search()
+        if self.wing.isVisible():
+            self.wing.follow()
         super().resizeEvent(ev)
 
     def _search_go(self) -> None:
@@ -465,67 +436,97 @@ class BrambleWindow(QWidget):
         self.hide_entry()
         if self.panel:
             self.panel.cancel_adding()
-        cat = SearchCategory(query)
-        panel = Panel(self, cat)
-        panel.searching = True
-        self.returning = False
-        self.open_row = self.search_row
-        self.shown_row = self.search_row
-        self.search_row.cat = cat
-        self.panel = panel
-        self.timeline.open()
-        self._settle()
+        wing = self.wing
+        wing.open_results(query)
         names = list(self.settings["sources"])
 
         def done(res, err):
-            panel.searching = False
-            if err or res is None:
-                panel.note = f"The search did not work: {err}"
+            if wing.query != query:
                 return
-            self.results = res.results
-            panel.note = "" if res.results else ("Nothing found." if not res.errors else
-                                                 " ".join(res.errors))
-            self._show_results(panel)
+            if err or res is None:
+                wing.set_results([], f"The search did not work: {err}")
+                return
+            note = "" if res.results else ("Nothing found." if not res.errors else " ".join(res.errors))
+            wing.set_results(res.results, note)
         self.run(lambda: sources.search(query, names), done)
 
-    def _show_results(self, panel: Panel) -> None:
-        jobs = {j.link: j for j in self.downloads.jobs if j.marrow is not None}
-        panel.set_results(self.results, jobs, panel.note)
+    def choose_result(self, r, row_y: float) -> None:
+        """A torrent clicked in the results window: download it into the holding folder
+        and show its download window below."""
+        existing = next((j for j in self.downloads.jobs if getattr(j, "source_link", "") == r.link), None)
+        if existing is not None:
+            self.wing.open_download(r, row_y, existing)
+            return
+        self.wing.open_download(r, row_y, None)
+        marrow = self._marrow()
+        title = kinds._tidy(r.title)
+
+        def work():
+            return sources.resolve(r)
+
+        def done(link, err):
+            if err or not link:
+                link = r.link
+            import uuid
+            holding = marrow / ".holding" / uuid.uuid4().hex[:10]
+            holding.mkdir(parents=True, exist_ok=True)
+            job = self.downloads.start(link, holding, marrow=marrow, title=title)
+            job.source_link = r.link
+            if self.wing.chosen is r:
+                self.wing.job = job
+            self._say(f"{title} is downloading")
+        self.run(work, done)
+
+    def play_landed(self, path: Path) -> None:
+        roots = library.library_roots(self.settings)
+        items = []
+        for c in library.categories(self.settings):
+            if any(f in path.parents or f == path for f in c.folders):
+                items = library.scan_category(c)
+        hit = next((i for i in items if i.path == path or i.path in path.parents
+                    or path in i.path.parents), None)
+        if hit is None:
+            return
+        settings = self.settings
+
+        def work():
+            return launcher.try_ways(hit, launcher.ways_for(hit, settings))
+        self.run(work, lambda out, err: self._say(
+            f"{hit.title} did not open" if (err or not out.ok) else f"opened {hit.title}"))
+
+    def get_tool(self, tool_id: str) -> None:
+        def work():
+            rel, errors = fetch.latest(tool_id)
+            if rel is None:
+                raise OSError("No download site answered.")
+            fetch.install(rel, self._tools_destination())
+            return True
+        self.run(work, lambda ok, err: (self.downloads.retry_failed() if ok else None,
+                                         self._say(f"could not get {tool_id}: {err}" if err else
+                                                   f"{tool_id} is ready")))
+
+    def escape_search(self) -> None:
+        if self.wing.dl_card.tl.opening:
+            self.wing.close_download()
+        elif self.wing.results_card.tl.opening:
+            self.wing.close_results()
+
+    def moveEvent(self, ev) -> None:
+        if self.wing.isVisible():
+            self.wing.follow()
+        super().moveEvent(ev)
 
     def _marrow(self) -> Path:
         """The library that downloads are filed into: the drive's when it is plugged in."""
         roots = library.library_roots(self.settings)
         return roots[0] if roots else paths.local_marrow()
 
-    def download_result(self, e) -> None:
-        r = e.result
-        marrow = self._marrow()
-        import uuid
-        holding = marrow / ".holding" / uuid.uuid4().hex[:10]
-        holding.mkdir(parents=True, exist_ok=True)
-        title = kinds._tidy(r.title)
-        e.download = self.downloads.start(r.link, holding, marrow=marrow, title=title)
-        self._say(f"{title} is downloading")
-
-    def play_path(self, path: Path, panel: Panel) -> None:
-        cat_name = path.relative_to(self._marrow()).parts[0] if self._marrow() in path.parents else None
-        items = []
-        for c in library.categories(self.settings):
-            if c.name == cat_name:
-                items = library.scan_category(c)
-        hit = next((i for i in items if i.path == path or path in i.path.parents
-                    or i.path in path.parents or i.path.parent == path), None)
-        if hit:
-            self.play(hit, panel)
-
     def keep_held(self, job):
-        self.downloads.keep_anyway(job)
-        self._job_ended(job)
-        return True, ""
+        self.run(lambda: self.downloads.keep_anyway(job), lambda *_: self._job_ended(job))
 
     def discard_held(self, job):
         self.downloads.throw_away(job)
-        return True, ""
+        self.wing.close_download()
 
     def _job_ended(self, job) -> None:
         if getattr(job, "stage", "") == "ready":
@@ -569,9 +570,9 @@ class BrambleWindow(QWidget):
         """The card: centred across the window under the chosen line, a fixed height
         (it never resizes while open; only the hovered title grows inside it)."""
         row = self.shown_row
-        if row is None or (row not in self.rows and row is not self.search_row):
+        if row is None or row not in self.rows:
             return None
-        index = 0 if row is self.search_row else self.rows.index(row)
+        index = self.rows.index(row)
         top = self._row_y(index) + look.ROW + 12
         w, h = self.width(), self.height()
         height = max(look.ROW * 2 + 2 * look.CARD_PAD, h - top - look.CARD_BOTTOM)
@@ -580,6 +581,7 @@ class BrambleWindow(QWidget):
     # --- frame ----------------------------------------------------------------------
     def _tick(self) -> None:
         self.bg.tick()
+        self.wing.tick()
         if self.returning and self.timeline.position() <= look.CARD_OPEN[0]:
             self.returning = False     # the card has folded away: now the lines come back
             self._settle()
@@ -589,6 +591,7 @@ class BrambleWindow(QWidget):
         self.update()
         busy = (self.timeline.moving or any(r.moving() for r in self.rows) or self.brand_a.moving or self.brand_k.moving or self.close_hover.moving or self.returning
                 or self.notice_a.moving or any(not j.finished for j in self.downloads.jobs)
+                or self.wing.moving()
                 or (self.panel and self.panel.moving()))
         self.timer.setInterval(16 if busy else 33)
 
@@ -600,11 +603,10 @@ class BrambleWindow(QWidget):
         w, h = self.width(), self.height()
         full = QRectF(0, 0, w, h)
         p.setClipPath(paint.rounded(full))
-        self.bg.paint(p, full)
+        self.bg.paint(p, full, canvas=self.canvas())
         self.regions = []
         self._paint_brand(p)
         self._paint_rows(p)
-        self._paint_search_row(p)
         self._paint_card(p)
         self._paint_notice(p)
         self._paint_close(p, w)
@@ -620,6 +622,10 @@ class BrambleWindow(QWidget):
         x = look.BRAND_POS[0]
         margin = x + b.left()
         return x, margin - m.ascent() - b.top()
+
+    def canvas(self) -> QRectF:
+        """One picture canvas for Bramble and its side windows, so the picture runs on."""
+        return QRectF(0, 0, self.width() + WING_W, self.height() + WING_EXTRA)
 
     def _paint_brand(self, p: QPainter) -> None:
         """At rest where _brand_origin puts it. A category open: the site's
@@ -679,30 +685,6 @@ class BrambleWindow(QWidget):
                 hit = QRectF(x - 4, y, (look.MARKER_W + tw) * s + 10, look.ROW)
                 self.regions.append((hit, f"row:{i}", lambda r=r: self.toggle(r)))
 
-    def _paint_search_row(self, p: QPainter) -> None:
-        r = self.search_row
-        op = r.op.value
-        if op <= 0.002 or r.cat is None:
-            return
-        f = paint.font(look.MENU_PX, look.MENU_WEIGHT, look.MENU_TRACK)
-        y = self._row_y(0)
-        x = self.x0 + r.x.value
-        s = r.scale.value
-        cy = y + look.ROW / 2
-        p.save()
-        p.setOpacity(op)
-        p.translate(x, cy)
-        p.scale(s, s)
-        p.translate(-x, -cy)
-        paint.draw_marker(p, x + paint.width("+", f) / 2, cy, look.MENU_PX, r.turn.value, look.DIM)
-        label = paint.elide(r.label, look.MENU_PX, self.width() - x - look.MARKER_W - 60)
-        tw = paint.draw_text(p, x + look.MARKER_W, cy - paint.text_height(f) / 2, label, look.MENU_PX,
-                             look.TEXT, look.MENU_WEIGHT, look.MENU_TRACK, glow=r.hover.value)
-        p.restore()
-        if op > 0.5:
-            self.regions.append((QRectF(x - 4, y, (look.MARKER_W + tw) * s + 10, look.ROW), "row:search",
-                                 lambda: self.toggle(self.search_row)))
-
     def _paint_notice(self, p: QPainter) -> None:
         """Bottom left, in Hawthorn's footer place: what is downloading, and what is ready."""
         active = [j for j in self.downloads.jobs if j.marrow is not None and not j.finished]
@@ -761,7 +743,7 @@ class BrambleWindow(QWidget):
             p.fillPath(paint.rounded(r.adjusted(-k, -k + 2, k, k + 2), look.RADIUS + k),
                        QColor(0, 0, 0, int(255 * a)))
         p.setClipPath(paint.rounded(r), Qt.ClipOperation.IntersectClip)
-        self.bg.paint(p, r, look.GLASS_SCRIM, blur=True)
+        self.bg.paint(p, r, look.GLASS_SCRIM, blur=True, canvas=self.canvas())
         p.setOpacity(1.0)
         if self.panel:
             self.panel.paint(p, card, text, look.SLIDE * (1 - text))
@@ -805,7 +787,6 @@ class BrambleWindow(QWidget):
                 r.mark.set(1.0 if on else 0.0)
             self._settle()
             self.close_hover.set(1.0 if key == "close" else 0.0)
-            self.search_row.hover.set(1.0 if key == "row:search" else 0.0)
             if self.panel:
                 self.panel.hover(key)
         edges = self._edges(pos)
@@ -854,6 +835,10 @@ class BrambleWindow(QWidget):
             self.search.clear()
             self.setFocus()
             return
+        if ev.key() == Qt.Key.Key_Escape and (self.wing.results_card.tl.opening
+                                               or self.wing.dl_card.tl.opening):
+            self.escape_search()
+            return
         if ev.key() == Qt.Key.Key_Escape:
             if self.entry.isVisible() and self.entry_for == "category":
                 self.hide_entry()
@@ -880,4 +865,5 @@ class BrambleWindow(QWidget):
 
     def closeEvent(self, ev) -> None:
         self.downloads.stop_all()
+        self.wing.close()
         super().closeEvent(ev)

@@ -69,6 +69,8 @@ class Job:
     reasons: list = field(default_factory=list)   # why a held one was held
     landed: Path | None = None       # where a ready one went
     kind: str = ""
+    speed: str = ""                  # "3.2MiB" a second, from aria2's readout
+    eta: str = ""                    # "6m12s"
 
     @property
     def state_text(self) -> str:
@@ -148,6 +150,10 @@ class Downloads:
             m = re.search(r"\((\d{1,3})%\)", line)
             if m and "B/0B" not in line:
                 job.percent = int(m.group(1))
+                sp = re.search(r"DL:([\d.]+[KMG]?i?B)", line)
+                et = re.search(r"ETA:(\w+)", line)
+                job.speed = sp.group(1) if sp else ""
+                job.eta = et.group(1) if et else ""
             if line.strip():
                 tail = (tail + [line.strip()])[-6:]
         code = job.proc.wait()

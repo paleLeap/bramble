@@ -166,14 +166,25 @@ def file_into_library(root: Path, v: Verdict, marrow: Path) -> Path:
             dest_root = dest_root / part
     dest_root.mkdir(parents=True, exist_ok=True)
     if root.is_dir() and len(v.keep) > 1:
-        target = dest_root / root.name
-        target.mkdir(exist_ok=True)
+        target = _free(dest_root / root.name)
+        target.mkdir()
         for p in v.keep:
             out = target / p.relative_to(root)
             out.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(p), str(out))
         return target
     src = v.keep[0] if v.keep else root
-    target = dest_root / src.name
+    target = _free(dest_root / src.name)
     shutil.move(str(src), str(target))
     return target
+
+
+def _free(target: Path) -> Path:
+    """Never mix into or overwrite something already in the library: "name (2)" instead."""
+    if not target.exists():
+        return target
+    stem, suffix = (target.stem, target.suffix) if target.suffix and not target.is_dir() else (target.name, "")
+    n = 2
+    while (target.parent / f"{stem} ({n}){suffix}").exists():
+        n += 1
+    return target.parent / f"{stem} ({n}){suffix}"

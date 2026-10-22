@@ -81,11 +81,14 @@ class Background:
                                    Qt.TransformationMode.SmoothTransformation))
         self.blurred = soft
 
-    def paint(self, p: QPainter, rect: QRectF, scrim: float = look.SCRIM, blur: bool = False) -> None:
+    def paint(self, p: QPainter, rect: QRectF, scrim: float = look.SCRIM, blur: bool = False,
+              canvas: QRectF | None = None) -> None:
         """Fill `rect` (window coordinates) with the pictures and the scrim. The
         pictures are laid out against the whole window, so a smaller rect shows the
         same picture continuing, as Hawthorn's cards do."""
-        win = p.window()
+        # The pictures are laid out against `canvas` (painter coordinates): Bramble and its
+        # side windows share one canvas, so the picture runs on through the gap between them.
+        win = canvas if canvas is not None else QRectF(p.window())
         w, h = win.width(), win.height()
         p.fillRect(rect, look.BG)
         if self.raw:
@@ -103,8 +106,8 @@ class Background:
                 # translate(%) applies to the layer box (the window), inside scale(1.14)
                 dx = (fx + (tx - fx) * k) * w * look.BG_SCALE
                 dy = (fy + (ty - fy) * k) * h * look.BG_SCALE
-                x = (w - pm.width()) / 2 + dx
-                y = (h - pm.height()) / 2 + dy
+                x = win.left() + (w - pm.width()) / 2 + dx
+                y = win.top() + (h - pm.height()) / 2 + dy
                 p.setOpacity(a)
                 p.drawPixmap(int(x), int(y), pm)
             p.restore()
