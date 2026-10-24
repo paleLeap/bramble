@@ -310,10 +310,11 @@ def claim_magnet_links() -> tuple[bool, str]:
     apps.mkdir(parents=True, exist_ok=True)
     exe = sys.executable
     exe = f'"{exe}"' if " " in exe else exe
+    run = f"{exe} %u" if getattr(sys, "frozen", False) else f"{exe} -m bramble %u"   # packaged, or from source
     (apps / DESKTOP).write_text(
         "[Desktop Entry]\nType=Application\nName=Bramble\n"
         "Comment=Media library and downloads\n"
-        f"Exec={exe} -m bramble %u\nPath={paths.APP_DIR}\n"
+        f"Exec={run}\nPath={paths.APP_DIR}\n"
         f"Icon={paths.PACKAGE_DIR / 'ui' / 'bramble.svg'}\n"
         f"MimeType={MAGNET};application/x-bittorrent;\nTerminal=false\nNoDisplay=true\n",
         encoding="utf-8")

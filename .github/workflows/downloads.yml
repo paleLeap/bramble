@@ -1,0 +1,104 @@
+# Bramble's downloads: on every version tag (v0.1.0, v0.2.0 ...) GitHub builds Bramble for
+# Windows and Linux, starts each one once to check it opens, and attaches both to that
+# version's release. The newest is always at
+#   https://github.com/paleLeap/bramble/releases/latest/download/Bramble-Windows.exe
+#   https://github.com/paleLeap/bramble/releases/latest/download/Bramble-Linux.tar.gz
+name: Downloads
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:          # build by hand (no release) from the Actions page
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: Bramble-Windows.exe
+          - os: ubuntu-22.04      # the oldest still offered, so it runs on most Linux PCs
+            asset: Bramble-Linux.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Bramble's parts and the packager
+        run: python -m pip install PyQt6 pyinstaller
+
+      - name: What Qt needs on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 \
+            libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 \
+            libxcb-xinerama0 libfontconfig1 libdbus-1-3
+
+      - name: The icon (Windows)
+        if: runner.os == 'Windows'
+        run: python packaging/make_icon.py
+
+      - name: Package
+        run: pyinstaller --noconfirm packaging/bramble.spec
+
+      - name: Check it opens (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $p = Start-Process -FilePath dist\Bramble.exe -ArgumentList '--selftest' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Bramble.exe --selftest failed ($($p.ExitCode))" }
+
+      - name: Check it opens (Linux)
+        if: runner.os == 'Linux'
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ./dist/Bramble/Bramble --selftest
+
+      - name: Pack
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp dist/Bramble.exe "${{ matrix.asset }}"
+          else
+            tar -C dist -czf "${{ matrix.asset }}" Bramble
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloads
+          merge-multiple: true
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'EOF'
+          **Windows:** download `Bramble-Windows.exe` and double-click it. Windows may say
+          "Windows protected your PC" because Bramble is new and unsigned: click
+          **More info**, then **Run anyway**.
+
+          **Linux:** download `Bramble-Linux.tar.gz`, extract it, and run `Bramble` inside
+          the Bramble folder.
+          EOF
+          gh release create "$GITHUB_REF_NAME" downloads/* --repo "$GITHUB_REPOSITORY" \
+            --title "Bramble ${GITHUB_REF_NAME#v}" --notes-file notes.md

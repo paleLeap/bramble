@@ -55,7 +55,8 @@ def _captured():
     """Collect what this thread prints, without touching other threads' output."""
     with _lock:
         if not isinstance(sys.stdout, _PerThreadStdout):
-            sys.stdout = _PerThreadStdout(sys.stdout)
+            # a packaged Bramble has no console (sys.stdout is None): stray prints go nowhere
+            sys.stdout = _PerThreadStdout(sys.stdout or io.StringIO())
     out = sys.stdout
     buf = io.StringIO()
     out.local.buf = buf

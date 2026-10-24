@@ -22,6 +22,10 @@ ARCH = platform.machine().lower()
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 APP_DIR = PACKAGE_DIR.parent
+if getattr(sys, "frozen", False):
+    # a packaged download: the program's own folder (on the drive, or wherever it was
+    # saved), not the temporary one its files unpack into
+    APP_DIR = Path(sys.executable).resolve().parent
 
 # The library's folders, in the order the window lists them.
 # None built in (user, 2026-10-22): a fresh Bramble shows only its name and "+". Every
