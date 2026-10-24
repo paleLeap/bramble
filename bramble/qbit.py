@@ -33,27 +33,83 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-CONFIG = """[LegalNotice]
-Accepted=true
+# DHT's first contacts. qBittorrent's own copy looks names up with its built-in resolver,
+# which on some PCs fails for minutes (seen 2026-10-23: no DHT nodes for three minutes);
+# Bramble looks them up with the PC's resolver and hands over the addresses as well.
+BOOTSTRAP = ("dht.libtorrent.org:25401", "dht.transmissionbt.com:6881", "router.bittorrent.com:6881",
+             "router.utorrent.com:6881", "dht.aelitis.com:6881")
 
-[BitTorrent]
-Session\\DefaultSavePath={save}
-Session\\GlobalMaxSeedingMinutes=0
-Session\\AddTorrentStopped=false
 
-[Preferences]
-General\\Locale=en
-General\\StartMinimized=true
-General\\NoSplashScreen=true
-General\\ExitConfirm=false
-Downloads\\SavePath={save}
-WebUI\\Enabled=true
-WebUI\\Address=127.0.0.1
-WebUI\\Port={port}
-WebUI\\LocalHostAuth=false
-WebUI\\CSRFProtection=false
-WebUI\\HostHeaderValidation=false
-"""
+def _bootstrap_nodes(wait: float = 2.0) -> str:
+    """The bootstrap list with each name's IPv4 addresses ahead of it (names kept as a fallback)."""
+    from concurrent.futures import ThreadPoolExecutor, wait as wait_all
+
+    def look(entry):
+        host, port = entry.rsplit(":", 1)
+        try:
+            infos = socket.getaddrinfo(host, int(port), socket.AF_INET, socket.SOCK_DGRAM)
+        except OSError:
+            return []
+        return sorted({f"{i[4][0]}:{port}" for i in infos})
+
+    pool = ThreadPoolExecutor(len(BOOTSTRAP))
+    futures = [pool.submit(look, e) for e in BOOTSTRAP]
+    wait_all(futures, timeout=wait)
+    pool.shutdown(wait=False)
+    found = [a for f in futures if f.done() for a in f.result()]
+    return ", ".join(dict.fromkeys(found + list(BOOTSTRAP)))
+
+
+def _own_settings(save: str, port: int) -> dict[tuple[str, str], str]:
+    """The settings Bramble needs. Everything else in the file is qBittorrent's own and stays
+    (its listening port among them, so peers and the router know it from one run to the next)."""
+    return {
+        ("LegalNotice", "Accepted"): "true",
+        ("BitTorrent", "Session\\DefaultSavePath"): save,
+        ("BitTorrent", "Session\\GlobalMaxSeedingMinutes"): "0",
+        # no sharing once it is down, and no opening of ports on the router (the owner's
+        # choice, 2026-10-23, first set by Warden in this file)
+        ("BitTorrent", "Session\\GlobalMaxRatio"): "0",
+        ("BitTorrent", "Session\\ShareLimitAction"): "Stop",
+        ("Network", "PortForwardingEnabled"): "false",
+        ("BitTorrent", "Session\\AddTorrentStopped"): "false",
+        ("BitTorrent", "Session\\QueueingSystemEnabled"): "false",   # start at once, never "queued"
+        # quoted: unquoted commas would make it a list, which qBittorrent ignores
+        ("BitTorrent", "Session\\DHTBootstrapNodes"): f'"{_bootstrap_nodes()}"',
+        ("Preferences", "General\\Locale"): "en",
+        ("Preferences", "General\\StartMinimized"): "true",
+        ("Preferences", "General\\NoSplashScreen"): "true",
+        ("Preferences", "General\\ExitConfirm"): "false",
+        ("WebUI", "Enabled"): "true",
+        ("WebUI", "Address"): "127.0.0.1",
+        ("WebUI", "Port"): str(port),
+        ("WebUI", "LocalHostAuth"): "false",
+        ("WebUI", "CSRFProtection"): "false",
+        ("WebUI", "HostHeaderValidation"): "false",
+    }
+
+
+def _write_config(conf: Path, own: dict[tuple[str, str], str]) -> None:
+    """Set Bramble's keys in qBittorrent's ini, leaving every other line as qBittorrent wrote it."""
+    sections: dict[str, list[str]] = {}
+    current = None
+    try:
+        lines = conf.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        if line.startswith("[") and line.rstrip().endswith("]"):
+            current = line.strip()[1:-1]
+            sections.setdefault(current, [])
+        elif current is not None and line.strip():
+            sections[current].append(line)
+    for (section, key), value in own.items():
+        rows = sections.setdefault(section, [])
+        rows[:] = [r for r in rows if r.split("=", 1)[0] != key] + [f"{key}={value}"]
+    # the old place for the web settings, from Bramble's first versions: qBittorrent moved them
+    sections["Preferences"] = [r for r in sections.get("Preferences", []) if not r.startswith("WebUI\\")]
+    conf.write_text("".join(f"[{name}]\n" + "".join(r + "\n" for r in rows) + "\n"
+                            for name, rows in sections.items()), encoding="utf-8")
 
 
 class Qbit:
@@ -62,9 +118,9 @@ class Qbit:
         self.profile = paths.data_dir() / "qbittorrent"
         conf = self.profile / "qBittorrent" / "config" / "qBittorrent.conf"
         conf.parent.mkdir(parents=True, exist_ok=True)
-        conf.write_text(CONFIG.format(save=str(paths.data_dir() / "qbt-downloads").replace("\\", "/"),
-                                      port=self.port), encoding="utf-8")
-        _clear_leftover(self.profile)
+        _clear_leftover(self.profile)          # before touching its file: a leftover copy rewrites it
+        _write_config(conf, _own_settings(str(paths.data_dir() / "qbt-downloads").replace("\\", "/"),
+                                          self.port))
         args = argv + [f"--profile={self.profile}", f"--webui-port={self.port}", "--confirm-legal-notice"]
         flags = {"creationflags": 0x08000000} if paths.IS_WINDOWS else {"start_new_session": True}
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **flags)

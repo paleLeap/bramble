@@ -5,9 +5,14 @@ import io
 import os
 import re
 import tempfile
+import threading
 import urllib.request
 
 headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0"}
+
+# The first page this thread's plugin asked for: its search page, which a browser can open
+# when the site refuses the plugin. Bramble clears it before each search.
+asked = threading.local()
 
 
 def htmlentitydecode(s):
@@ -15,6 +20,8 @@ def htmlentitydecode(s):
 
 
 def retrieve_url(url, custom_headers={}, request_data=None, ssl_context=None, unescape_html_entities=True):
+    if request_data is None and not getattr(asked, "first", ""):
+        asked.first = url
     req = urllib.request.Request(url, request_data, {**headers, **custom_headers})
     with urllib.request.urlopen(req, timeout=20, context=ssl_context) as r:
         data = r.read()

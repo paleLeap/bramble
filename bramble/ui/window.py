@@ -14,7 +14,9 @@ again, or the card's x, plays it all backwards.
 """
 from __future__ import annotations
 
+import re
 import shutil
+import time
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QPointF, QRectF, Qt, QTimer, pyqtSignal
@@ -26,6 +28,13 @@ from . import anim, look, paint
 from .background import Background
 from .panel import Panel
 from .wing import WING_EXTRA, WING_W, Wing
+
+
+def _moves_itself() -> bool:
+    """X11: Bramble drags its own window. Elsewhere the system's move (Windows reports where
+    the window is all the way through, and Wayland lets no window place itself)."""
+    from PyQt6.QtGui import QGuiApplication
+    return QGuiApplication.platformName() == "xcb"
 
 
 class _Bridge(QObject):
@@ -102,6 +111,8 @@ class BrambleWindow(QWidget):
         self.downloads = downloads.Downloads(settings, lambda job: self._bridge.done.emit(
             (lambda *_: self._job_ended(job), None, None)))
         self.wing = Wing(self)                   # the search windows, outside to the right
+        self.last_site = ("", 0.0)               # the site last opened in the browser, and when
+        self._drag_from = None                   # where in the window a drag took hold (X11)
         from PyQt6.QtWidgets import QApplication
         QApplication.clipboard().dataChanged.connect(self.wing.clipboard_changed)
         self.notice = ""                         # bottom left: progress, and "... is ready"
@@ -282,6 +293,44 @@ class BrambleWindow(QWidget):
         self.entry_for = ""
         self.setFocus()
 
+    def save_link(self, title: str, url: str, folder: Path | None) -> Path | None:
+        """Keep a web page in a category (a book the library lends): a .url file named for
+        it, listed with the rest and opened in the browser."""
+        if folder is None:
+            from .. import vet
+            folder = vet.category_folder(self._marrow(), "link")
+        name = re.sub(r'[\\/:*?"<>|]+', " ", title).strip() or "link"
+        target = folder / f"{name}.url"
+        n = 2
+        while target.exists():
+            target = folder / f"{name} ({n}).url"
+            n += 1
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            target.write_text(f"[InternetShortcut]\nURL={url}\n", encoding="utf-8")
+        except OSError as e:
+            self._say(f"Could not save the link: {e}", secs=10)
+            return None
+        self.set_categories(library.categories(self.settings))
+        self.refresh_panel()
+        self._say(f"saved the link in {folder.name}", secs=6)
+        return target
+
+    def new_category_folder(self, text: str) -> Path | None:
+        """Make a category (a folder in the library) and show it; returns its folder."""
+        name = "".join(ch for ch in text if ch not in '/\\:*?"<>|').strip()
+        if not name or name.startswith("."):
+            return None
+        folder = self._marrow() / name
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            if name.lower() not in [n.lower() for n in self.settings["category_order"]]:
+                self.settings["category_order"] = list(self.settings["category_order"]) + [name]
+        except OSError:
+            return None
+        self.set_categories(library.categories(self.settings))
+        return folder
+
     def _entry_done(self) -> None:
         text = self.entry.text().strip()
         what = self.entry_for
@@ -291,15 +340,7 @@ class BrambleWindow(QWidget):
                 self.panel.mode = "list"
             return
         if what == "category":
-            name = "".join(ch for ch in text if ch not in '/\\:*?"<>|').strip()
-            if name:
-                home = self._marrow()
-                try:
-                    (home / name).mkdir(parents=True, exist_ok=True)
-                    self.settings["category_order"] = list(self.settings["category_order"]) + [name]
-                except OSError:
-                    pass
-                self.set_categories(library.categories(self.settings))
+            self.new_category_folder(text)
             return
         if what == "add" and self.panel:
             self.panel.mode = "list"
@@ -358,9 +399,14 @@ class BrambleWindow(QWidget):
 
         def work():
             ways = launcher.ways_for(item, settings, pr)
+            if ways and ways[0].tool_id == launcher.CHOOSE:
+                return system.apps_for(item.target)          # the person picks, in the card
             return launcher.try_ways(item, ways)
 
         def done(outcome, err):
+            if isinstance(outcome, list):
+                panel.offer_programs(item, outcome)
+                return
             if err:
                 from ..launcher import Attempt, Outcome
                 outcome = Outcome(False, attempts=[Attempt("Bramble", False, str(err))])
@@ -372,6 +418,48 @@ class BrambleWindow(QWidget):
                     lg[item.kind] = tool
                     settings["last_good"] = lg
         self.run(work, done)
+
+    def open_with(self, item, app, panel: Panel) -> None:
+        """A program picked in the card: open it there, and use it for this kind of file
+        from now on."""
+        ext = item.target.suffix.lower()
+        if ext:
+            self.settings["open_with"] = {**self.settings["open_with"], ext: {"id": app.id, "name": app.name}}
+        info = panel.infos.get(item.key)
+        if info:
+            info.programs = None
+            info.busy = True
+
+        def work():
+            return launcher.try_ways(item, [launcher.app_way(app.id, app.name, item.target)])
+
+        def done(outcome, err):
+            if err:
+                from ..launcher import Attempt, Outcome
+                outcome = Outcome(False, attempts=[Attempt(app.name, False, str(err))])
+            panel.opened(item, outcome)
+        self.run(work, done)
+
+    def show_item_folder(self, item) -> None:
+        system.show_in_folder(item.path)
+
+    def categories_now(self) -> list:
+        return library.categories(self.settings)
+
+    def move_item(self, item, cat, panel: Panel) -> None:
+        """Into another category: the file (or its folder) moves there, never over anything."""
+        from .. import vet
+        src = item.path                  # a file, or a game's whole folder
+        try:
+            cat.home.mkdir(parents=True, exist_ok=True)
+            dest = vet._free(cat.home / src.name)
+            shutil.move(str(src), str(dest))
+        except OSError as e:
+            self._say(f"Could not move it: {e}", secs=10)
+            return
+        self._say(f"moved to {cat.name}", secs=6)
+        self.set_categories(library.categories(self.settings))
+        self.refresh_panel()
 
     def fix(self, f, item, panel: Panel) -> None:
         info = panel.infos.get(item.key) if item else None
@@ -450,11 +538,12 @@ class BrambleWindow(QWidget):
         self.hide_entry()
         if self.panel:
             self.panel.cancel_adding()
+        self.warm_torrents()
         wing = self.wing
         wing.open_results(query)
         names = list(self.settings["sources"])
         off = set(self.settings["sources_off"])
-        sites = sources.site_results(query, self.settings["sites"], off)
+        sites = sources.site_results(sources.torrent_query(query), self.settings["sites"], off)
         self.close_leaf()
 
         def done(res, err):
@@ -463,13 +552,26 @@ class BrambleWindow(QWidget):
             if err or res is None:
                 wing.set_results(sites, f"The search did not work: {err}")
                 return
-            found = sites + res.results
+            found = res.results if res.free else sites + res.results   # a free copy: no sites
             errors = [e for e in res.errors if not (sites and e.startswith("No search sources"))]
+            if res.free:
+                errors = []                  # a torrent site's trouble does not matter now
             note = "" if found else ("Nothing found." if not errors else " ".join(errors))
             if found and errors:
                 note = " ".join(errors)
+            if res.note:
+                note = f"{res.note} {note}".strip()
             wing.set_results(found, note)
         self.run(lambda: sources.search(query, names, off), done)
+
+    def warm_torrents(self) -> None:
+        """Start qBittorrent in the background as soon as someone searches, so it has found
+        its way around the network by the time they pick something (from cold that took most
+        of 45 seconds)."""
+        if self.settings["torrent_program"] == "aria2":
+            return
+        from .. import qbit
+        self.run(qbit.get)               # a failure here is ignored: the download will say why
 
     def add_site(self, address: str) -> None:
         """A site's search page pasted into the search box: open it for every search."""
@@ -588,27 +690,78 @@ class BrambleWindow(QWidget):
         p.restore()
 
     def choose_result(self, r, row_y: float) -> None:
-        """A result clicked: its page opens in the browser, and the download window offers a
-        box for the magnet link the person copies there. Nothing downloads until they do."""
+        """A result clicked: its link, with its name and where it came from, waiting for
+        Confirm. or Deny. Nothing downloads until then. Fewest steps first: the link the
+        result already carries; else the site asked for it in the background; only a site
+        that turns programs away is opened in the browser, whose Magnet link comes back
+        here (handoff) or through the clipboard."""
         existing = next((j for j in self.downloads.jobs if getattr(j, "source_link", "") == r.link), None)
         if existing is not None:
             self.wing.open_download(r, row_y, existing)
             return
-        page = r.page or (r.link if r.link.startswith(("http://", "https://"))
-                          and not r.link.lower().split("?")[0].endswith(".torrent") else "")
         if r.site:
-            # a site's own results page: open it; the link comes from what the person copies
-            from PyQt6.QtCore import QUrl
-            from PyQt6.QtGui import QDesktopServices
-            QDesktopServices.openUrl(QUrl(r.page))
-            self.wing.open_paste(r, row_y, prefill="")
+            self._open_in_browser(r.page, r.title)
+            self.wing.open_paste(r, row_y, focus=False)
             return
+        link = r.link
+        if r.borrow:
+            self.wing.open_paste(r, row_y, prefill=r.page)    # Open. or Save link.
+            return
+        if r.direct or downloads.is_torrent(link):
+            self.wing.open_paste(r, row_y, prefill=link)      # the link is already here
+            return
+        if r.plugin is not None:
+            self.wing.open_paste(r, row_y)
+            self.wing.finding = True
+
+            def done(got, err):
+                if self.wing.chosen is not r or not self.wing.finding:
+                    return                   # put away, or another one chosen, meanwhile
+                self.wing.finding = False
+                if got:
+                    self.wing.paste.setText(got)
+                    self.wing.wake()
+                elif r.page:
+                    self.wing.focus_paste = False
+                    self._open_in_browser(r.page, r.source)   # the site would not say
+            self.run(lambda: sources.resolve(r), done)
+            return
+        page = r.page or (link if link.startswith(("http://", "https://")) else "")
         if page:
-            from PyQt6.QtCore import QUrl
-            from PyQt6.QtGui import QDesktopServices
-            QDesktopServices.openUrl(QUrl(page))
-        # no page to open (the source gives the link itself): offer that link instead
-        self.wing.open_paste(r, row_y, prefill="" if page else r.link)
+            self._open_in_browser(page, r.source)
+        self.wing.open_paste(r, row_y, prefill="" if page else link, focus=not page)
+
+    def _open_in_browser(self, page: str, site: str) -> None:
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
+        QDesktopServices.openUrl(QUrl(page))
+        self.last_site = (site, time.monotonic())    # a Magnet link handed back soon came from there
+
+    def handoff(self, link: str) -> None:
+        """A magnet link (or .torrent) given to Bramble from outside: clicked in the browser,
+        or passed to a second launch. It waits for Confirm. or Deny. like any other."""
+        link = link.strip()
+        if not (link.startswith("magnet:") or downloads.looks_like_link(link)):
+            return
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self.warm_torrents()
+        w = self.wing
+        if w.pasting and w.dl_card.tl.opening and not w.finding and not w._link_ok():
+            w.paste.setText(link)            # the box was waiting for exactly this
+            w.wake()
+            w.raise_()
+            return
+        site, at = self.last_site
+        origin = site if site and time.monotonic() - at < 30 * 60 else "your browser"
+        r = sources.Result(title=downloads.title_of(link), link=link, source=origin)
+        if not w.results_card.tl.opening:
+            w.open_results(origin)
+            w.set_results([r], "")
+        w.handed = True
+        w.open_paste(r, w.results_rect().top() + 22, prefill=link)
+        w.raise_()
 
     def start_link(self, link: str, title: str = "", into: Path | None = None, source_link: str = "",
                    program: str = ""):
@@ -938,6 +1091,12 @@ class BrambleWindow(QWidget):
         return e
 
     def mouseMoveEvent(self, ev) -> None:
+        if self._drag_from is not None and ev.buttons() & Qt.MouseButton.LeftButton:
+            to = ev.globalPosition().toPoint() - self._drag_from
+            self.move(to)
+            if self.wing.isVisible():
+                self.wing.follow(to)
+            return
         pos = ev.position()
         key, _ = self._hit(pos)
         if key != self.hover_key:
@@ -986,8 +1145,16 @@ class BrambleWindow(QWidget):
         handle = self.windowHandle()
         if edges and handle:
             handle.startSystemResize(edges)
+        elif _moves_itself():
+            # on X11 the window manager reports a system move only when it ends, so the side
+            # windows would jump after; moving it here keeps them alongside the whole way
+            self._drag_from = ev.globalPosition().toPoint() - self.pos()
         elif handle:
             handle.startSystemMove()
+
+    def mouseReleaseEvent(self, ev) -> None:
+        self._drag_from = None
+        super().mouseReleaseEvent(ev)
 
     def wheelEvent(self, ev) -> None:
         card = self._card_geometry()

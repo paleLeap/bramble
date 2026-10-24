@@ -173,11 +173,14 @@ def default_app_for(path: Path) -> str | None:
     """The .desktop file Linux would open this with."""
     if not paths.IS_LINUX or not shutil.which("xdg-mime"):
         return None
-    r = _run(["xdg-mime", "query", "filetype", str(path)])
-    if not r or not r.stdout.strip():
+    mime = _mime_of(path)
+    if not mime:
         return None
-    r2 = _run(["xdg-mime", "query", "default", r.stdout.strip()])
-    return r2.stdout.strip() if r2 else None
+    for m in sorted(_same_kinds(mime), key=lambda m: m != mime):   # its own name first
+        r = _run(["xdg-mime", "query", "default", m])
+        if r and r.stdout.strip():
+            return r.stdout.strip()
+    return None
 
 
 def default_is_browser(path: Path) -> bool:
@@ -193,6 +196,88 @@ def open_with_default(path: Path) -> subprocess.Popen | None:
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
+class App:
+    """A program on this PC that says it opens a kind of file (its .desktop entry)."""
+
+    def __init__(self, app_id: str, name: str):
+        self.id, self.name = app_id, name
+
+
+def _mime_of(path: Path) -> str:
+    r = _run(["xdg-mime", "query", "filetype", str(path)]) if shutil.which("xdg-mime") else None
+    return r.stdout.strip() if r and not r.returncode else ""
+
+
+def _same_kinds(mime: str) -> set[str]:
+    """A file type and its other names ("application/x-cd-image" is the old name of
+    "application/vnd.efi.iso"). Not its broader parents: an EPUB is a zip, but the
+    archive manager is no way to read a book."""
+    names = {mime}
+    for d in _data_dirs():
+        try:
+            for line in (d / "mime" / "aliases").read_text().splitlines():
+                parts = line.split()
+                if len(parts) == 2 and mime in parts:
+                    names.update(parts)
+        except OSError:
+            continue
+    return names
+
+
+def _data_dirs() -> list[Path]:
+    home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+    dirs = [home] + [Path(d) for d in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":") if d]
+    dirs += [Path("/var/lib/flatpak/exports/share"), Path.home() / ".local/share/flatpak/exports/share"]
+    return list(dict.fromkeys(dirs))
+
+
+def apps_for(path: Path) -> list[App]:
+    """The programs on this PC that open this kind of file, the PC's own choice first;
+    never a web browser (it would only offer to download the file again), never Bramble."""
+    if not paths.IS_LINUX:
+        return []
+    mime = _mime_of(path)
+    if not mime:
+        return []
+    kinds = _same_kinds(mime)
+    found: dict[str, App] = {}
+    for d in _data_dirs():
+        folder = d / "applications"
+        try:
+            files = sorted(folder.glob("*.desktop"))
+        except OSError:
+            continue
+        for f in files:
+            if f.name in found or f.name == "bramble.desktop" or BROWSERS.search(f.name):
+                continue
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            entry = text.split("[Desktop Entry]", 1)[-1].split("\n[", 1)[0]
+            fields = dict(l.split("=", 1) for l in entry.splitlines() if "=" in l and not l.startswith("#"))
+            types = set(filter(None, fields.get("MimeType", "").split(";")))
+            if not types & kinds or fields.get("Hidden", "").lower() == "true":
+                continue
+            if BROWSERS.search(fields.get("Exec", "")):
+                continue
+            found[f.name] = App(f.name, fields.get("Name", f.stem))
+    first = ""
+    for m in kinds:
+        r = _run(["xdg-mime", "query", "default", m])
+        if r and r.stdout.strip() in found:
+            first = r.stdout.strip()
+            break
+    return sorted(found.values(), key=lambda a: (a.id != first, a.name.lower()))
+
+
+def open_with(app_id: str, path: Path) -> list[str]:
+    """The command that opens `path` in the program `app_id` (a .desktop name)."""
+    if shutil.which("gtk-launch"):
+        return ["gtk-launch", app_id.removesuffix(".desktop"), str(path)]
+    return ["gio", "launch", app_id, str(path)]
+
+
 def show_in_folder(path: Path) -> None:
     if paths.IS_WINDOWS:
         subprocess.Popen(["explorer", "/select,", str(path)])
@@ -200,6 +285,50 @@ def show_in_folder(path: Path) -> None:
         target = path if path.is_dir() else path.parent
         subprocess.Popen(["xdg-open", str(target)], start_new_session=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# --- magnet links ----------------------------------------------------------------
+
+MAGNET = "x-scheme-handler/magnet"
+DESKTOP = "bramble.desktop"
+
+
+def magnet_handler() -> str:
+    """The program the PC opens magnet links with (its .desktop name), or ""."""
+    r = _run(["xdg-mime", "query", "default", MAGNET]) if paths.IS_LINUX else None
+    return r.stdout.strip() if r and not r.returncode else ""
+
+
+def claim_magnet_links() -> tuple[bool, str]:
+    """Make Bramble the PC's magnet-link handler, so a Magnet link clicked in the browser
+    comes straight to Bramble's Confirm. / Deny. Returns (ok, the handler it replaced)."""
+    if not paths.IS_LINUX or not shutil.which("xdg-mime"):
+        return False, ""
+    import sys
+    before = magnet_handler()
+    apps = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "applications"
+    apps.mkdir(parents=True, exist_ok=True)
+    exe = sys.executable
+    exe = f'"{exe}"' if " " in exe else exe
+    (apps / DESKTOP).write_text(
+        "[Desktop Entry]\nType=Application\nName=Bramble\n"
+        "Comment=Media library and downloads\n"
+        f"Exec={exe} -m bramble %u\nPath={paths.APP_DIR}\n"
+        f"Icon={paths.PACKAGE_DIR / 'ui' / 'bramble.svg'}\n"
+        f"MimeType={MAGNET};application/x-bittorrent;\nTerminal=false\nNoDisplay=true\n",
+        encoding="utf-8")
+    _run(["update-desktop-database", str(apps)])
+    r = _run(["xdg-mime", "default", DESKTOP, MAGNET])
+    ok = bool(r) and not r.returncode and magnet_handler() == DESKTOP
+    return ok, (before if before != DESKTOP else "")
+
+
+def give_back_magnet_links(before: str) -> bool:
+    """Hand magnet links back to the program that had them before Bramble."""
+    if not paths.IS_LINUX or not before:
+        return False
+    r = _run(["xdg-mime", "default", before, MAGNET])
+    return bool(r) and not r.returncode
 
 
 # --- installing ---------------------------------------------------------------------

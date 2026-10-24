@@ -40,6 +40,12 @@ def looks_like_link(text: str) -> bool:
     return bool(LINK.match(t)) or (t.lower().endswith(".torrent") and Path(t).exists())
 
 
+def is_torrent(link: str) -> bool:
+    """A magnet link or a .torrent (file or address), as opposed to a plain file to fetch."""
+    t = link.strip()
+    return t.lower().startswith("magnet:") or t.lower().split("?")[0].endswith(".torrent")
+
+
 def title_of(link: str) -> str:
     link = link.strip()
     if link.lower().startswith("magnet:"):
@@ -135,6 +141,9 @@ class Downloads:
         """The chosen program first; the other if it cannot start, refuses the link, or fails."""
         from . import qbit
         why = ""
+        if not is_torrent(job.link):
+            self._start_aria2(job)           # a plain file (a free library's PDF): no torrent
+            return
         if getattr(job, "program", "qbittorrent") == "aria2" and self.aria2():
             self._start_aria2(job)
             if not job.failed:
@@ -325,6 +334,8 @@ def _named(path: Path, title: str) -> Path:
     if not path.is_file() or not title:
         return path
     clean = re.sub(r'[\\/:*?"<>|]+', " ", title).strip()
+    if path.suffix:                  # "netinst iso" + ".iso": the name already says it
+        clean = re.sub(rf"(?i)[\s.]+{re.escape(path.suffix[1:])}$", "", clean) or clean
     target = path.with_name(clean + path.suffix)
     if target != path and not target.exists():
         path.rename(target)

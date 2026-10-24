@@ -14,6 +14,7 @@ VIDEO = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".webm", ".wmv", ".flv", ".mpg"
 AUDIO = {".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".wma", ".alac",
          ".aiff", ".ape", ".mka"}
 IMAGE = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".heic", ".avif"}
+LINK = {".url"}           # a web page kept in a category (a book to borrow), opened in the browser
 DOCUMENT = {".pdf", ".epub", ".mobi", ".cbz", ".cbr", ".txt", ".md", ".doc", ".docx",
             ".odt", ".rtf", ".xls", ".xlsx", ".ods", ".ppt", ".pptx"}
 ARCHIVE = {".zip", ".7z", ".rar", ".tar", ".gz", ".xz", ".bz2", ".zst", ".tgz"}
@@ -209,6 +210,8 @@ def classify(path: Path, category: str | None = None) -> str:
     """The kind of a single file. `category` is the library folder it sits in."""
     ext = path.suffix.lower()
     in_games = category == "Video Games"
+    if ext in LINK:
+        return "link"
     if ext in VIDEO:
         if category == "TV Shows" or EPISODE_RE.search(path.stem):
             return "episode"
@@ -248,7 +251,7 @@ DEFAULT_NAME = {"movies": "movies", "tv": "tv shows", "games": "video games", "m
 GROUP_OF_KIND = {"movie": "movies", "episode": "tv", "music": "music", "rom": "games",
                  "game_windows": "games", "game_linux": "games", "document": "books",
                  "program": "other", "installer": "other", "image": "other", "archive": "other",
-                 "other": "other"}
+                 "link": "books", "other": "other"}
 
 
 def group_of_name(name: str) -> str:
@@ -264,14 +267,14 @@ CATEGORY_FOR_KIND = {
     "movie": "Movies", "episode": "TV Shows", "music": "Music",
     "rom": "Video Games", "game_windows": "Video Games", "game_linux": "Video Games",
     "program": "Programs", "installer": "Programs",
-    "image": "Other", "document": "Other", "archive": "Other", "other": "Other",
+    "image": "Other", "document": "Other", "archive": "Other", "link": "Other", "other": "Other",
 }
 
 KIND_LABEL = {
     "movie": "Movie", "episode": "TV episode", "music": "Music", "rom": "Retro game",
     "game_windows": "Windows game", "game_linux": "Linux game", "program": "Program",
     "installer": "Installer", "image": "Picture", "document": "Document",
-    "archive": "Archive", "other": "File",
+    "archive": "Archive", "link": "Web page", "other": "File",
 }
 
 

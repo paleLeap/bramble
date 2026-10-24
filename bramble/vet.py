@@ -162,7 +162,7 @@ def file_into_library(root: Path, v: Verdict, marrow: Path, into: Path | None = 
     a particular category); returns where it went. Films keep their own folder (as
     torrents make them) unless they are a single file."""
     dest_root = into if into is not None else category_folder(marrow, v.kind)
-    if into is None and v.kind in ("episode", "rom", "game_windows", "game_linux"):
+    if v.kind in ("episode", "rom", "game_windows", "game_linux"):     # show / season, system
         main = max(v.keep, key=lambda p: p.stat().st_size)
         for part in kinds.suggested_subfolder(Path(main.name), v.kind if v.kind != "game_windows" else "x"):
             dest_root = dest_root / part

@@ -63,6 +63,19 @@ class Info:
     busy: bool = False
     loaded: bool = False
     pr: probe.Probe | None = None
+    programs: list | None = None      # no sure program: the ones to choose from ([] = none)
+
+
+def _install_reader() -> tuple[bool, str]:
+    """Foliate, a reader for EPUB books, from the PC's own software sources."""
+    import subprocess
+    from .. import system
+    cmd = system.install_command("foliate", "johnfactotum.Foliate")
+    if not cmd:
+        return False, "A book reader cannot be installed here automatically."
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    return (True, "") if r.returncode == 0 else (False, (r.stderr or r.stdout).strip()[-300:]
+                                                 or "The book reader was not installed.")
 
 
 def _plain(html: str) -> str:
@@ -86,6 +99,11 @@ def info_line(item: Item, pr: probe.Probe | None) -> str:
         bits.append(duration(pr.duration))
     elif k == "rom" and item.system:
         bits.append(item.system.name)
+    elif k == "link":
+        from urllib.parse import urlsplit
+        from .. import launcher
+        host = urlsplit(launcher.link_address(item.target)).netloc.removeprefix("www.")
+        bits.append(f"web page · {host}" if host else "web page")
     return "  ·  ".join(bits)
 
 
@@ -221,6 +239,13 @@ class Panel:
             info.issues = issues
         self.host.run(work, done)
 
+    def offer_programs(self, item: Item, apps: list) -> None:
+        """Nothing sure opens this: show the programs that can, to pick inside Bramble."""
+        info = self.infos.setdefault(item.key, Info())
+        info.busy = False
+        info.error, info.error_fixes, info.hint = [], [], ""
+        info.programs = apps
+
     def opened(self, item: Item, outcome) -> None:
         info = self.infos.setdefault(item.key, Info())
         info.busy = False
@@ -348,6 +373,8 @@ class Panel:
                 h += self._error_h(info.error, width, bool(info.error_fixes))
                 if info.hint:
                     h += 17 * len(self._wrap(info.hint, 12, width)) + 4
+            if info.programs is not None:
+                h += self._programs_h(e.item, info.programs, width)
         return h
 
     def _paint_info(self, p, e: Entry, x, y, width) -> None:
@@ -387,6 +414,88 @@ class Panel:
                 for chunk in self._wrap(info.hint, 12, width):
                     paint.draw_text(p, x, y, chunk, 12, look.DIM)
                     y += 17
+        if info.programs is not None:
+            y = self._programs_box(p, e, x, y, width, info.programs)
+
+    READERS = (".epub", ".mobi", ".azw3", ".fb2")
+
+    def _nothing_opens(self, item: Item) -> str:
+        ext = item.target.suffix.lower().lstrip(".").upper() or "these"
+        return f"Nothing on this PC opens {ext} files yet."
+
+    def _programs_h(self, item: Item, apps: list, width: float) -> float:
+        if apps:
+            body = 17 + 18 * len(apps)
+        else:
+            body = 17 * len(self._wrap(self._nothing_opens(item), 12, width - 16))
+            body += 18 if item.target.suffix.lower() in self.READERS else 0
+        return 8 + body + 6 + 18 + 18 * len(self._move_lines(width)) + 8 + 8
+
+    def _move_lines(self, width: float) -> list[list]:
+        """The other categories, "Move to" first, wrapped to the box's width."""
+        others = [c for c in self.host.categories_now() if c.name != self.category.name]
+        if not others:
+            return []
+        f = paint.font(look.NOTE_PX)
+        lines, cur = [], []
+        room = width - 20
+        used = paint.width("Move to", f) + 8
+        for c in others:
+            w = paint.width(c.label, f) + 10
+            if cur and used + w > room:
+                lines.append(cur)
+                cur, used = [], 0.0
+            cur.append(c)
+            used += w
+        lines.append(cur)
+        return lines
+
+    def _programs_box(self, p, e: Entry, x, y, width, apps: list) -> float:
+        """Open with: the programs on this PC that open this kind of file (the PC's usual
+        one first); then show it in its folder, or move it to another category."""
+        item = e.item
+        h = self._programs_h(item, apps, width) - 8
+        p.fillRect(QRectF(x, y + 2, width, h), look.alpha(look.FAINT, 0.10))
+        p.fillRect(QRectF(x, y + 2, 2, h), look.alpha(look.FAINT, 0.6))
+        tx, ty = x + 10, y + 7
+
+        def action(key, label, fn, ax, ay, px=look.NOTE_PX, base=look.DIM):
+            k = f"fix:{e.key}:{key}"
+            hv = 1.0 if self.hover_key == k else 0.0
+            w = paint.draw_text(p, ax, ay, label, px, look.mix(base, look.TEXT, hv), glow=hv * 0.6)
+            self.regions.append((QRectF(ax - 2, ay - 2, w + 6, 17), k, fn))
+            return w
+
+        if apps:
+            paint.draw_text(p, tx, ty, "Open with", 12, look.FAINT)
+            ty += 17
+            for i, app in enumerate(apps):
+                w = action(f"prog:{i}", app.name, lambda a=app: self.host.open_with(item, a, self),
+                           tx + 8, ty, look.NOTE_PX + 1, look.TEXT if i == 0 else look.DIM)
+                if i == 0 and len(apps) > 1:
+                    paint.draw_text(p, tx + 8 + w + 8, ty + 1, "usual", 11, look.FAINT)
+                ty += 18
+        else:
+            for chunk in self._wrap(self._nothing_opens(item), 12, width - 16):
+                paint.draw_text(p, tx, ty, chunk, 12, look.DIM)
+                ty += 17
+            if item.target.suffix.lower() in self.READERS:
+                action("reader", "install a book reader (Foliate)",
+                       lambda: self.host.fix(checks.Fix("Install a book reader", run=_install_reader,
+                                                        asks_password=True), item, self), tx, ty)
+                ty += 18
+        ty += 6
+        action("folder", "Show in folder.", lambda: self.host.show_item_folder(item), tx, ty)
+        for n, line in enumerate(self._move_lines(width)):
+            ty += 18
+            ax = tx
+            if n == 0:
+                paint.draw_text(p, ax, ty, "Move to", look.NOTE_PX, look.FAINT)
+                ax += paint.width("Move to", paint.font(look.NOTE_PX)) + 8
+            for c in line:
+                w = action(f"move:{c.name}", c.label, lambda c=c: self.host.move_item(item, c, self), ax, ty)
+                ax += w + 10
+        return y + h + 8
 
     def _error_h(self, lines, width, has_fixes) -> float:
         n = sum(len(self._wrap(l, 12, width - 16)) for l in lines)

@@ -15,6 +15,7 @@ import io
 import re
 import sys
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -111,12 +112,23 @@ class Plugin:
         self.engine = _load(path)
         self.name = getattr(self.engine, "name", path.stem)
 
-    def search(self, query: str) -> list[Result]:
-        import novaprinter                      # the shim in _nova
+    def search(self, query: str, cat: str = "all") -> list[Result]:
+        import helpers                          # the shims in _nova
+        import novaprinter
         rows: list[dict] = []
         novaprinter.collect(rows, type(self.engine).__module__)
-        with _captured():
-            self.engine.search(urllib.parse.quote(query), "all")
+        helpers.asked.first = ""
+        try:
+            with _captured():
+                cats = getattr(self.engine, "supported_categories", {}) or {}
+                self.engine.search(urllib.parse.quote(query), cat if cat in cats else "all")
+        except urllib.error.HTTPError as e:
+            # The site turns programs away (most often a browser check) but not people: offer
+            # its own search page instead, opened in the browser, with the Magnet Link. box.
+            page = helpers.asked.first or e.url
+            if e.code not in (401, 403, 429, 503) or not page:
+                raise
+            return [Result(title=self.name, link=page, source=self.name, page=page, site=True)]
         out = []
         for d in rows:
             name = str(d.get("name", "")).strip()

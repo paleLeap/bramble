@@ -17,7 +17,12 @@ DEFAULTS = {
     # foreign-language lines), "off".
     "subtitles": "full",
     "subtitle_language": "eng",
-    "fullscreen_video": True,
+    # Films open in a window the size of the picture (the player's own key goes fullscreen).
+    "fullscreen_video": False,
+    # The PC's magnet-link handler before Bramble claimed it (to give it back), "" if none.
+    "magnet_handler_before": "",
+    # The program picked inside Bramble for a kind of file: {".iso": {"id": ..., "name": ...}}.
+    "open_with": {},
     # Per-file memory: {path: {"runner": id, "exe": path}}.
     "remembered": {},
     # Which program last worked for each kind, so it is tried first next time.

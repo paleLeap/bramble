@@ -14,19 +14,28 @@ of the results window at that row, across then down, and the download window
 unfolds below. Hawthorn's timeline (across, down/up, the card, its text), played
 backwards to close.
 
+Confirm. asks where to save it, among the person's own categories (the one that fits
+marked). Once it is downloading the results window folds away and the download window
+rises into its place, on the line from the search box.
+
+Out of the way when not in use: something new (results, the paste box, a finished
+download) shows them fully for a moment, then they fade back to a faint REST until
+the pointer is over them or the paste box is being typed in.
+
 All of it is drawn on one see-through window beside Bramble that follows it;
 it only takes clicks where something is drawn.
 """
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 
 from PyQt6.QtCore import QPointF, QRect, QRectF, Qt
-from PyQt6.QtGui import QColor, QPainter, QRegion
-from PyQt6.QtWidgets import QWidget
+from PyQt6.QtGui import QColor, QImage, QPainter, QRegion
+from PyQt6.QtWidgets import QGraphicsOpacityEffect, QLineEdit, QWidget
 
-from .. import kinds, sources
+from .. import downloads, kinds, library, sources
 from . import anim, look, paint
 
 WING_W = 300             # how far the side windows reach right of Bramble
@@ -38,6 +47,8 @@ DL_SHIFT = 37            # the download window sits this far right of the result
 TIMELINE = (0.00, 0.28), (0.28, 0.52), (0.52, 1.00), (0.90, 1.12)   # across, turn, card, text
 LINE_START = 6
 ROW_H = 40               # a result: its name, and a faint line of facts under it
+REST = 0.22              # how faint the side windows rest when the pointer is elsewhere
+WAKE_S = 3.0             # how long something new shows fully before they fade back
 
 
 class Card:
@@ -63,6 +74,7 @@ class Wing(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)     # Enter and Escape once the box is gone
         self.setWindowTitle("bramble search")
         self.results_card = Card()
         self.dl_card = Card()
@@ -79,7 +91,6 @@ class Wing(QWidget):
         self.regions: list[tuple[QRectF, str, object]] = []
         self.dl_h = anim.Prop(84.0, look.GROW_MS)
         self.pasting = False             # the download window is asking for a magnet link
-        from PyQt6.QtWidgets import QLineEdit
         from PyQt6.QtGui import QPalette
         self.paste = QLineEdit(self)
         self.paste.hide()
@@ -95,11 +106,43 @@ class Wing(QWidget):
         self.paste.returnPressed.connect(self._pasted)
         self.paste.textChanged.connect(lambda _t: self.update())
         self.choosing = False            # the list of torrent programs is open
+        self.finding = False             # asking the result's site for its magnet link
+        self.focus_paste = True          # take the keyboard when the box shows (not when the browser has it)
+        self.placing = False             # Confirm. pressed: asking which category to save into
+        self.solo = anim.Prop(0.0, look.MOVE_MS)   # 1: downloading, in the results window's place
+        self.name_box = QLineEdit(self)  # a new category's name, typed while placing
+        self.name_box.hide()
+        self.name_box.setFrame(False)
+        self.name_box.setPlaceholderText("New category.")
+        self.name_box.setStyleSheet(self.paste.styleSheet())
+        self.name_box.setPalette(pal)
+        self.name_box.setFont(paint.font(look.NOTE_PX + 1))
+        self.name_box.returnPressed.connect(self._named)
+        self.name_box.setGraphicsEffect(QGraphicsOpacityEffect(self.name_box))
+        self.handed = False              # the link came from outside (the browser), not a search
+        self.over = False                # the pointer is on a side window
+        self.woke = 0.0                  # when something new last appeared (time.monotonic)
+        self.seen_state = ""             # the download's last state worth waking for
+        self.presence = anim.Prop(1.0, look.FADE_MS, look.css_ease)
+        self.paste_fade = QGraphicsOpacityEffect(self.paste)
+        self.paste.setGraphicsEffect(self.paste_fade)
+
+    def wake(self) -> None:
+        """Something new to see: show fully, and fade back after WAKE_S if nobody looks."""
+        self.woke = time.monotonic()
+        self.presence.set(1.0)
+
+    def _awake(self) -> bool:
+        return (self.over or self.paste.hasFocus() or self.name_box.hasFocus() or self.searching
+                or self.choosing or self.placing or time.monotonic() - self.woke < WAKE_S)
 
     # --- where it sits ------------------------------------------------------------
-    def follow(self) -> None:
+    def follow(self, at=None) -> None:
+        """Sit against Bramble's right edge; `at` is where Bramble is going (mid-drag, before
+        its own geometry has caught up)."""
         g = self.main.geometry()
-        self.setGeometry(g.x() + g.width(), g.y(), WING_W, g.height() + WING_EXTRA)
+        x, y = (at.x(), at.y()) if at is not None else (g.x(), g.y())
+        self.setGeometry(x + g.width(), y, WING_W, g.height() + WING_EXTRA)
 
     def canvas(self) -> QRectF:
         """Bramble's and this window's shared picture canvas, in this window's coordinates."""
@@ -113,8 +156,15 @@ class Wing(QWidget):
         return QRectF(GAP, top, RES_W, bottom - top)
 
     def dl_rect(self) -> QRectF:
+        """Under the results window; while downloading, risen into its place (bottom-aligned
+        with it, so the line from the search box meets it where it met the results)."""
         r = self.results_rect()
-        return QRectF(r.left() + DL_SHIFT, r.bottom() + 22, DL_W, self.dl_h.value)
+        h = self.dl_h.value
+        k = self.solo.value
+        x = r.left() + DL_SHIFT + (r.left() - (r.left() + DL_SHIFT)) * k
+        y = r.bottom() + 22 + ((r.bottom() - h) - (r.bottom() + 22)) * k
+        y = min(y, self.height() - h - 10)        # grown (the categories): up, never cut off
+        return QRectF(x, y, DL_W, h)
 
     def search_y(self) -> float:
         return self.main.height() - 24          # the middle of Bramble's search box
@@ -123,15 +173,18 @@ class Wing(QWidget):
     def open_results(self, query: str) -> None:
         self.query = query
         self.results, self.note, self.searching = [], "", True
+        self.handed = False
         self.scroll = 0.0
         self.close_download()
         self.follow()
         self.show()
         self.raise_()
+        self.wake()
         self.results_card.tl.open()
 
     def set_results(self, results: list, note: str) -> None:
         self.results, self.note, self.searching = results, note, False
+        self.wake()
 
     def close_results(self) -> None:
         self.close_download()
@@ -139,16 +192,28 @@ class Wing(QWidget):
 
     def open_download(self, result, row_y: float, job) -> None:
         self.chosen, self.chosen_row_y, self.job = result, row_y, job
-        self.pasting = False
+        self.pasting = self.placing = False
         self.paste.hide()
+        self.name_box.hide()
+        if not self.dl_card.shown:
+            self.solo.jump(0.0)
+        self.wake()
         self.dl_card.tl.open()
 
-    def open_paste(self, result, row_y: float, prefill: str = "") -> None:
-        """The download window, asking for the link the person copies from the site's page."""
+    def open_paste(self, result, row_y: float, prefill: str = "", focus: bool = True) -> None:
+        """The download window, asking for the link the person copies from the site's page.
+        focus=False when that page has just opened in the browser: the browser stays in front
+        (the box still fills itself from the clipboard, and then comes forward)."""
         self.chosen, self.chosen_row_y, self.job = result, row_y, None
+        self.focus_paste = focus
         self.pasting = True
-        self.choosing = False
+        self.choosing = self.placing = False
+        self.finding = False
+        self.name_box.hide()
+        if not self.dl_card.shown:
+            self.solo.jump(0.0)
         self.paste.setText(prefill)
+        self.wake()
         self.dl_card.tl.open()
 
     def clipboard_changed(self) -> None:
@@ -159,33 +224,114 @@ class Wing(QWidget):
         text = QApplication.clipboard().text().strip()
         if text.startswith("magnet:?") or text.lower().split("?")[0].endswith(".torrent"):
             self.paste.setText(text)
+            self.wake()
             self.main.raise_()
             self.raise_()
 
+    def origin(self) -> str:
+        """Where the link came from, as the person would say it."""
+        r = self.chosen
+        if r is None:
+            return ""
+        return r.title if getattr(r, "site", False) else r.source
+
+    def _deny(self) -> None:
+        """Not that one. From a site's page: wait for another. Otherwise: put it away."""
+        self.choosing = False
+        self.placing = False
+        self.name_box.hide()
+        if getattr(self.chosen, "site", False):
+            self.paste.clear()
+        elif self.handed:
+            self.close_results()
+        else:
+            self.close_download()
+
     def _link_ok(self) -> bool:
-        from .. import downloads
         link = self.paste.text().strip()
         return bool(link) and (link.startswith("magnet:?") or downloads.looks_like_link(link))
 
     def _pasted(self) -> None:
+        """Confirm. (or Enter): ask where it goes. Enter while asking: the marked category."""
         if not self._link_ok():
             return
-        link = self.paste.text().strip()
-        self.pasting = False
+        if self.placing:
+            fit = self._fitting()
+            self._start(fit.home if fit else None)
+            return
+        if not library.categories(self.main.settings):
+            self._start(None)                # no categories yet: filed by kind, as before
+            return
+        self.placing = True
         self.choosing = False
+        self.wake()
+
+    def _open_page(self) -> None:
+        r = self.chosen
+        self.main._open_in_browser(r.page, r.source)
+
+    def _start(self, into: Path | None) -> None:
+        r = self.chosen
+        if getattr(r, "borrow", False):
+            # a book the library lends: keep its page in the category, nothing to download
+            self.main.save_link(r.title, r.page, into)
+            self.placing = False
+            self.name_box.hide()
+            self.close_download()
+            return
+        link = self.paste.text().strip()
+        self.pasting = self.placing = self.choosing = False
         self.paste.hide()
+        self.name_box.hide()
         r = self.chosen
         site = bool(r and getattr(r, "site", False))
         self.job = self.main.start_link(link, title=r.title if (r and not site) else "",
-                                        source_link=r.link if r else "",
-                                        program=self.main.settings["torrent_program"])
+                                        source_link=r.link if (r and not site) else "",
+                                        program=self.main.settings["torrent_program"], into=into)
+        # the results have done their part: fold them away, the download rises into their place
+        self.results_card.tl.close()
+        self.solo.set(1.0)
+        self.wake()
+
+    def _named(self) -> None:
+        """A new category typed while placing: make its folder and save there."""
+        name = self.name_box.text().strip().strip("/\\")
+        if not name or name.startswith("."):
+            return
+        home = self.main.new_category_folder(name)
+        if home is not None:
+            self._start(home)
+
+    def _shown_title(self) -> str:
+        r = self.chosen
+        if r is not None and getattr(r, "site", False) and self._link_ok():
+            return downloads.title_of(self.paste.text())
+        return r.title if r is not None else ""
+
+    def _fitting(self):
+        """The person's category this most likely belongs in, by its name and source."""
+        r, title = self.chosen, self._shown_title()
+        group = ""
+        if getattr(r, "kind_hint", "") == "book" or re.search(r"(?i)\b(pdf|epub|mobi|azw3)\b", title):
+            group = "books"
+        elif kinds.episode_info(Path(kinds._tidy(title) + ".x")) or re.search(
+                r"(?i)\b(s\d\d|season \d+|complete series)\b", kinds._tidy(title)):
+            group = "tv"
+        elif getattr(r, "quality", "") or re.search(
+                r"(?i)\b(2160p|1080p|720p|480p|bluray|web-?dl|webrip|x26[45]|hevc)\b", title):
+            group = "movies"
+        elif re.search(r"(?i)\b(flac|mp3|album|discography)\b", title):
+            group = "music"
+        return next((c for c in library.categories(self.main.settings) if c.kind == group), None)
 
     def _choose(self, program: str) -> None:
         self.main.settings["torrent_program"] = program
         self.choosing = False
 
     def close_download(self) -> None:
-        self.pasting = False
+        self.pasting = self.placing = False
+        self.finding = False
+        self.name_box.hide()
         self.paste.hide()
         self.dl_card.tl.close()
 
@@ -193,13 +339,24 @@ class Wing(QWidget):
         return (self.results_card.tl.moving or self.dl_card.tl.moving or self.searching
                 or self.dl_h.moving or (self.job is not None and not self.job.finished)
                 or any(p.moving for p in self.row_hover.values())
-                or self.results_card.close_hover.moving or self.dl_card.close_hover.moving)
+                or self.results_card.close_hover.moving or self.dl_card.close_hover.moving
+                or self.presence.moving or time.monotonic() - self.woke < WAKE_S + 0.1
+                or self.solo.moving)
 
     def tick(self) -> None:
         if not self.results_card.shown and not self.dl_card.shown:
             if self.isVisible():
                 self.hide()
             return
+        job = self.job
+        state = job.state_text if job is not None and (job.finished or job.waiting) else ""
+        if state != self.seen_state:
+            self.seen_state = state
+            if state:
+                self.wake()              # ready, held, failed, or nobody sharing it
+        target = 1.0 if self._awake() else REST
+        if self.presence.target != target:
+            self.presence.set(target)
         self.update()
 
     # --- drawing -------------------------------------------------------------------
@@ -209,8 +366,26 @@ class Wing(QWidget):
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self.regions = []
         mask = QRegion()
-        mask = mask.united(self._paint_results(p))
-        mask = mask.united(self._paint_download(p))
+        fade = self.presence.value
+        if fade >= 0.999:
+            mask = mask.united(self._paint_results(p))
+            mask = mask.united(self._paint_download(p))
+        else:
+            # the cards set their own opacities, so draw them whole and fade the picture
+            dpr = self.devicePixelRatioF()
+            img = QImage(int(self.width() * dpr), int(self.height() * dpr),
+                         QImage.Format.Format_ARGB32_Premultiplied)
+            img.setDevicePixelRatio(dpr)
+            img.fill(Qt.GlobalColor.transparent)
+            q = QPainter(img)
+            q.setRenderHints(p.renderHints())
+            mask = mask.united(self._paint_results(q))
+            mask = mask.united(self._paint_download(q))
+            q.end()
+            p.setOpacity(fade)
+            p.drawImage(0, 0, img)
+        self.paste_fade.setOpacity(fade)
+        self.name_box.graphicsEffect().setOpacity(fade)
         p.end()
         # clicks only where something is drawn; the rest of this window lets them through
         self.setMask(mask if not mask.isEmpty() else QRegion(0, 0, 1, 1))
@@ -285,10 +460,13 @@ class Wing(QWidget):
         width = inner.width() - 14
         if self.searching:
             self._busy(p, x, y + 10)
-        elif not self.results:
+        elif not self.results or self.note:
+            # nothing found, or something to say about what was found ("No free copy ...")
             for line in _wrap(self.note or "Nothing found.", look.NOTE_PX, width):
                 paint.draw_text(p, x, y, line, look.NOTE_PX, look.FAINT)
                 y += 16
+            if self.results:
+                y += 8
         for r in self.results:
             key = "res:" + r.link
             hp = self.row_hover.setdefault(key, anim.Prop(0.0, look.COLOR_MS, look.css_ease))
@@ -317,14 +495,26 @@ class Wing(QWidget):
             return QRegion()
         res = self.results_rect()
         full = self.dl_rect()
+        k = self.solo.value
         bx = res.right() + 28
         corner = QPointF(bx, full.top())
         ry = max(res.top() + 10, min(res.bottom() - 10, self.chosen_row_y))
+        # the line from the results row, gone as the results fold away
+        keep = max(0.0, 1.0 - 2 * k)
         self._lines(p, [QPointF(res.right() + 4, ry), QPointF(bx, ry), QPointF(bx, full.top() - 6)],
-                    card.part(0), card.part(1))
-        c = card.part(2)
+                    card.part(0) * keep, card.part(1) * keep)
         region = QRegion(QRect(int(res.right()), int(ry) - 2, int(bx - res.right()) + 3, 5)).united(
-            QRegion(QRect(int(bx) - 2, int(ry), 5, int(full.top() - ry) + 3)))
+            QRegion(QRect(int(bx) - 2, int(ry), 5, int(full.top() - ry) + 3))) if keep else QRegion()
+        if k > 0.001:
+            # risen into the results window's place: on the line from the search box, as it was
+            sy, cx = self.search_y(), res.left() + 16
+            self._lines(p, [QPointF(LINE_START, sy), QPointF(cx, sy), QPointF(cx, res.bottom() + 6)],
+                        card.part(0), card.part(1))
+            region = region.united(QRegion(QRect(0, int(sy) - 2, int(cx) + 3, 5))).united(
+                QRegion(QRect(int(cx) - 2, int(res.bottom()), 5, int(sy - res.bottom()) + 3)))
+            if k > 0.5:
+                corner = QPointF(cx, full.bottom())      # it folds back into the line's end
+        c = card.part(2)
         if c <= 0.002:
             return region
         now = self._card(p, full, corner, c)
@@ -338,6 +528,51 @@ class Wing(QWidget):
             p.restore()
         return region
 
+    def _placing_rows(self, p: QPainter, x: float, y: float, width: float, live: bool) -> float:
+        """Where to save it: the person's categories, the fitting one marked (Enter takes it),
+        and a new one by name."""
+        paint.draw_text(p, x, y, "Save to", look.NOTE_PX, look.FAINT)
+        y += 22
+        fit = self._fitting()
+        for cat in library.categories(self.main.settings):
+            hk = "into:" + cat.name
+            hv = 1.0 if self.hover_key == hk else 0.0
+            on = fit is not None and cat.name == fit.name
+            paint.draw_text(p, x + 12, y, cat.label, look.LIST_PX,
+                            look.mix(look.TEXT if on else look.DIM, look.TEXT, hv), glow=hv)
+            self._ring(p, x + width - 8, y + 9, on)
+            if live:
+                self.regions.append((QRectF(x + 4, y - 2, width, 22), hk,
+                                     lambda home=cat.home: self._start(home)))
+            y += 24
+        if self.name_box.isVisible():
+            if live:
+                self.name_box.setGeometry(int(x + 12), int(y), int(width - 12), 20)
+            y += 28
+        else:
+            hv = 1.0 if self.hover_key == "into+" else 0.0
+            paint.draw_text(p, x + 12, y, "+ new category", look.NOTE_PX + 1,
+                            look.mix(look.FAINT, look.TEXT, hv))
+            if live:
+                self.regions.append((QRectF(x + 4, y - 2, width, 20), "into+", self._new_category))
+            y += 24
+        hv = 1.0 if self.hover_key == "back" else 0.0
+        w = paint.draw_text(p, x, y + 2, "Back.", look.NOTE_PX, look.mix(look.FAINT, look.TEXT, hv))
+        if live:
+            self.regions.append((QRectF(x - 2, y, w + 6, 18), "back", self._unplace))
+        return y + 22
+
+    def _new_category(self) -> None:
+        self.name_box.clear()
+        self.name_box.show()
+        self.activateWindow()
+        self.name_box.setFocus()
+
+    def _unplace(self) -> None:
+        self.placing = False
+        self.name_box.hide()
+        self.setFocus()
+
     def _download_text(self, p: QPainter, full: QRectF, shift: float, live: bool) -> None:
         job = self.job
         inner = full.adjusted(12, 12, -12, -12)
@@ -348,51 +583,90 @@ class Wing(QWidget):
             paint.draw_text(p, cx.left() + 6, cx.top() + 3, "×", 13, look.alpha(look.TEXT, hv))
         if live:
             self.regions.append((cx, "close-download", self.close_download))
+        offered = self.pasting and not self.finding and self._link_ok()
         title = kinds._tidy(self.chosen.title)
         if getattr(self.chosen, "site", False):
-            # what was searched, until the pasted link brings its own name
-            title = self.job.title if self.job is not None else self.query
-        paint.draw_text(p, x, y, paint.elide(title, look.LIST_PX, width), look.LIST_PX, look.TEXT)
-        y += 22
-        if self.pasting:
-            # the box for the link copied from the site's page
+            # what was searched, until the link brings its own name
+            if self.job is not None:
+                title = self.job.title
+            elif offered:
+                title = kinds._tidy(downloads.title_of(self.paste.text()))
+            else:
+                title = self.query
+        lines = _wrap(title, look.LIST_PX, width)[:3] if offered else [paint.elide(title, look.LIST_PX, width)]
+        for line in lines:
+            paint.draw_text(p, x, y, line, look.LIST_PX, look.TEXT)
+            y += 20
+        y += 2
+        if self.pasting and self.finding:
+            if self.paste.isVisible():
+                self.paste.hide()
+            paint.draw_text(p, x, y, f"getting the link from {self.origin()}…", look.NOTE_PX, look.FAINT)
+            self.dl_h.set(max(70.0, y + 28 - full.top()))
+            return
+        if self.pasting and not offered:
+            # the box for the link from the site's page (or the browser, or the clipboard)
             if live:
                 self.paste.setGeometry(int(x), int(y), int(width), 20)
                 if not self.paste.isVisible():
                     self.paste.show()
-                    self.activateWindow()
-                    self.paste.setFocus()
+                    if self.focus_paste:
+                        self.activateWindow()
+                        self.paste.setFocus()
             elif self.paste.isVisible():
                 self.paste.hide()
             y += 30
-            if self._link_ok():
-                # it grows a little: which program will download it, and a way to change that
-                names = {"qbittorrent": "qBittorrent", "aria2": "aria2"}
-                prog = self.main.settings["torrent_program"]
-                q = f"Download with {names.get(prog, prog)}?"
-                hv = 1.0 if self.hover_key == "go" else 0.0
-                w = paint.draw_text(p, x, y, q, look.LIST_PX, look.mix(look.DIM, look.TEXT, hv), glow=hv)
+            self.dl_h.set(max(70.0, y - full.top() + 8))
+            return
+        if offered:
+            # the link is here: its name, where it came from, and Confirm. or Deny.
+            if self.paste.isVisible():
+                self.paste.hide()
+                self.setFocus()                  # Enter confirms, Escape closes
+            names = {"qbittorrent": "qBittorrent", "aria2": "aria2"}
+            prog = self.main.settings["torrent_program"]
+            torrent = downloads.is_torrent(self.paste.text())
+            lent = getattr(self.chosen, "borrow", False)
+            kind = getattr(self.chosen, "quality", "") or "file"
+            facts = f"from {self.origin()}  ·  " + (
+                "borrow free, with an account" if lent else
+                names.get(prog, prog) if torrent else f"{kind} download")
+            paint.draw_text(p, x, y, paint.elide(facts, look.NOTE_PX, width), look.NOTE_PX, look.FAINT)
+            y += 24
+            if self.placing:
+                y = self._placing_rows(p, x, y, width, live)
+                self.dl_h.set(max(70.0, y - full.top() + 8))
+                return
+            cx = x
+            buttons = ((("open", "Open.", self._open_page), ("confirm", "Save link.", self._pasted))
+                       if lent else (("confirm", "Confirm.", self._pasted),))
+            for key, label, fn in buttons + (("deny", "Deny.", self._deny),):
+                hv = 1.0 if self.hover_key == key else 0.0
+                w = paint.draw_text(p, cx, y, label, look.LIST_PX, look.mix(look.DIM, look.TEXT, hv), glow=hv)
                 if live:
-                    self.regions.append((QRectF(x - 2, y - 2, w + 6, 20), "go", self._pasted))
+                    self.regions.append((QRectF(cx - 2, y - 2, w + 6, 20), key, fn))
+                cx += w + 16
+            if torrent:                          # a plain file needs no torrent program
                 hv2 = 1.0 if self.hover_key == "change" else 0.0
-                cw = paint.draw_text(p, x + w + 10, y + 2, "Change.", look.NOTE_PX,
-                                     look.mix(look.FAINT, look.TEXT, hv2))
+                cw = paint.width("Change.", paint.font(look.NOTE_PX))
+                paint.draw_text(p, x + width - cw, y + 2, "Change.", look.NOTE_PX,
+                                look.mix(look.FAINT, look.TEXT, hv2))
                 if live:
-                    self.regions.append((QRectF(x + w + 8, y, cw + 6, 18), "change",
+                    self.regions.append((QRectF(x + width - cw - 2, y, cw + 6, 18), "change",
                                          lambda: setattr(self, "choosing", not self.choosing)))
-                y += 24
-                if self.choosing:
-                    for key, label in (("qbittorrent", "qBittorrent"), ("aria2", "aria2")):
-                        on = key == prog
-                        hk = "prog:" + key
-                        hv3 = 1.0 if self.hover_key == hk else 0.0
-                        paint.draw_text(p, x + 12, y, label, look.NOTE_PX + 1,
-                                        look.mix(look.TEXT if on else look.FAINT, look.TEXT, hv3))
-                        self._ring(p, x + width - 8, y + 8, on)
-                        if live:
-                            self.regions.append((QRectF(x + 4, y - 2, width, 20), hk,
-                                                 lambda k=key: self._choose(k)))
-                        y += 20
+            y += 24
+            if self.choosing and torrent:
+                for key, label in (("qbittorrent", "qBittorrent"), ("aria2", "aria2")):
+                    on = key == prog
+                    hk = "prog:" + key
+                    hv3 = 1.0 if self.hover_key == hk else 0.0
+                    paint.draw_text(p, x + 12, y, label, look.NOTE_PX + 1,
+                                    look.mix(look.TEXT if on else look.FAINT, look.TEXT, hv3))
+                    self._ring(p, x + width - 8, y + 8, on)
+                    if live:
+                        self.regions.append((QRectF(x + 4, y - 2, width, 20), hk,
+                                             lambda k=key: self._choose(k)))
+                    y += 20
             self.dl_h.set(max(70.0, y - full.top() + 8))
             return
         if job is None:
@@ -495,7 +769,12 @@ class Wing(QWidget):
             self.dl_card.close_hover.set(1.0 if key == "close-download" else 0.0)
         self.setCursor(Qt.CursorShape.PointingHandCursor if key else Qt.CursorShape.ArrowCursor)
 
+    def enterEvent(self, _e) -> None:
+        self.over = True
+        self.presence.set(1.0)
+
     def leaveEvent(self, _e) -> None:
+        self.over = False
         self.hover_key = None
         for prop in self.row_hover.values():
             prop.set(0.0)
@@ -517,6 +796,8 @@ class Wing(QWidget):
     def keyPressEvent(self, ev) -> None:
         if ev.key() == Qt.Key.Key_Escape:
             self.main.escape_search()
+        elif ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self.pasting and self._link_ok():
+            self._pasted()
 
 
 def _wrap(text: str, px: float, width: float) -> list[str]:

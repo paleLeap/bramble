@@ -60,6 +60,23 @@ def selftest() -> int:
     return 0
 
 
+def _magnets(claim: bool) -> int:
+    """Make Bramble the PC's magnet-link handler, or give magnet links back."""
+    from . import system
+    from .settings import Settings
+    s = Settings()
+    if claim:
+        ok, before = system.claim_magnet_links()
+        if ok and before:
+            s["magnet_handler_before"] = before
+        print(f"magnet links now open in Bramble (before: {before or 'nothing'})" if ok
+              else "could not make Bramble the magnet-link handler")
+    else:
+        ok = system.give_back_magnet_links(s["magnet_handler_before"])
+        print(f"magnet links back to {s['magnet_handler_before']}" if ok else "nothing to give back")
+    return 0 if ok else 1
+
+
 def main() -> int:
     args = sys.argv[1:]
     if "--version" in args:
@@ -67,7 +84,11 @@ def main() -> int:
         return 0
     if "--selftest" in args:
         return selftest()
+    if "--claim-magnets" in args or "--give-back-magnets" in args:
+        return _magnets(claim="--claim-magnets" in args)
     _log_setup()
+    # a magnet link or .torrent handed over by the browser (Bramble is the PC's magnet handler)
+    link = next((a for a in args if a.startswith("magnet:") or a.lower().endswith(".torrent")), "")
     from PyQt6.QtNetwork import QLocalServer, QLocalSocket
     app = _qt_app(sys.argv)
 
@@ -78,7 +99,7 @@ def main() -> int:
     sock = QLocalSocket()
     sock.connectToServer(key)
     if sock.waitForConnected(300):
-        sock.write(b"show\n")
+        sock.write(f"link {link}\n".encode() if link else b"show\n")
         sock.flush()
         sock.waitForBytesWritten(300)
         return 0
@@ -90,15 +111,27 @@ def main() -> int:
     from .ui.window import BrambleWindow
     win = BrambleWindow(Settings())
 
-    def raise_window():
+    def heard():
         conn = server.nextPendingConnection()
-        if conn:
-            conn.readAll()
-        win.showNormal()
-        win.raise_()
-        win.activateWindow()
-    server.newConnection.connect(raise_window)
+        if not conn:
+            return
+
+        def read():
+            said = bytes(conn.readAll()).decode("utf-8", "replace").strip()
+            if said.startswith("link "):
+                win.handoff(said[5:])
+            else:
+                win.showNormal()
+                win.raise_()
+                win.activateWindow()
+        conn.readyRead.connect(read)            # what it says may arrive after it connects
+        if conn.bytesAvailable():
+            read()
+    server.newConnection.connect(heard)
     win.show()
+    if link:
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(600, lambda: win.handoff(link))
     logging.info("bramble %s started from %s", __version__, paths.APP_DIR)
 
     # Whatever way Bramble ends (closed, killed, logged out), its torrent program ends too.

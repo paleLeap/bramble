@@ -353,7 +353,8 @@ def _scan_mixed(folder: Path, category: str, root: Path, depth: int = 0) -> list
                 items.extend(_scan_mixed(p, category, root, depth + 1))
             continue
         ext = _strip_partial(p).suffix.lower()
-        if ext in JUNK or ext in kinds.SUBTITLE or "sample" in p.name.lower():
+        kept_link = depth == 0 and ext in kinds.LINK      # saved by the person, not a site's advert
+        if (ext in JUNK and not kept_link) or ext in kinds.SUBTITLE or "sample" in p.name.lower():
             continue
         try:
             st = p.stat()

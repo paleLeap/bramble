@@ -183,19 +183,64 @@ def ways_for(item: Item, settings, pr: probe.Probe | None = None, progress=None)
             ways.append(Way("Install with apt (asks for your password)", "pkexec",
                             lambda: (["pkexec", "apt-get", "install", "-y", str(target)], {}, None)))
         else:
-            ways.append(Way("This PC's default app", "default"))
+            ways += pick_ways(item, settings)
 
     elif k == "archive":
-        ways.append(Way("This PC's default app", "default"))
+        ways += pick_ways(item, settings)
+
+    elif k == "link":
+        url = link_address(target)
+        if url:
+            argv = (["cmd", "/c", "start", "", url] if paths.IS_WINDOWS else ["xdg-open", url])
+            ways.append(Way("Web browser", "browser", lambda: (argv, {}, None)))
+        else:
+            ways.append(Way("Web browser", "browser", available=False, note="The link file is empty."))
 
     else:
-        ways.append(Way("This PC's default app", "default"))
+        ways += pick_ways(item, settings)
 
     # A remembered choice for this exact item goes first.
     chosen = settings.recall(item.key).get("way")
     if chosen:
         ways.sort(key=lambda w: 0 if w.label == chosen else 1)
     return ways
+
+
+CHOOSE = "choose"           # no sure program: the person picks one inside Bramble
+
+
+def pick_ways(item: Item, settings) -> list[Way]:
+    """A file Bramble has no player for (a document, a disc image, a picture ...): the
+    program picked for this kind of file before; else the only program the PC has for it,
+    when the PC already counts it its own; else nothing sure, and the person chooses
+    inside Bramble. Never the PC's "default" blindly: with none set, Linux hands the file
+    to the web browser, which only offers to download it again."""
+    target = item.target
+    if paths.IS_WINDOWS:
+        return [Way("This PC's default app", "default")]
+    ext = target.suffix.lower()
+    picked = (settings["open_with"] or {}).get(ext) if ext else None
+    if picked:
+        return [app_way(picked["id"], picked["name"], target)]
+    apps = system.apps_for(target)
+    if len(apps) == 1 and system.default_app_for(target) == apps[0].id:
+        return [app_way(apps[0].id, apps[0].name, target)]
+    return [Way("Choose a program", CHOOSE, available=False, note="choose")]
+
+
+def app_way(app_id: str, name: str, target: Path) -> Way:
+    return Way(name, "app", lambda: (system.open_with(app_id, target), {}, None))
+
+
+def link_address(path: Path) -> str:
+    """The address in a .url file ([InternetShortcut] URL=...)."""
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.strip().lower().startswith("url="):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
 
 
 def _linux_native_ways(target: Path) -> list[Way]:
